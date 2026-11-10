@@ -38,6 +38,7 @@ recorder: str | None = None
 
 For lower temporary disk use, try the opt-in
 [direct video encoding](direct-encoding.md) recorder option and its hardware-free benchmark.
+For two real Lite6 arms, use the [Lite6 leader–follower recording trial](lite6-direct-encoding.md).
 
 ## Run Teleoperation for Data Collection
 

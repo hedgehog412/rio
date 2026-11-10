@@ -6,12 +6,12 @@ from rio.cfg.common import RecorderCfg
 
 @dataclass
 class BimanualSO100Station:
-    arm1: str = "SoArm"
+    arm1: str = "SoArm"  # Right arm
     arm1_cfg: NodeCfg | None = field(
         default_factory=lambda: NodeCfg(
             addr="127.0.0.1:5555",
-            port="/dev/ttyACM0",
-            calibration_file="/home/portegak/.cache/huggingface/lerobot/calibration/robots/so100_follower/follower_L.json",
+            port="/dev/ttyACM1",
+            calibration_file="/home/jihyun/.cache/huggingface/lerobot/calibration/robots/so_follower/follower_right.json",
             robot_controller="joint_pos",
         )
     )
@@ -21,32 +21,32 @@ class BimanualSO100Station:
         default_factory=lambda: NodeCfg(
             addr="127.0.0.1:5556",
             port="/dev/ttyACM2",
-            calibration_file="/home/portegak/.cache/huggingface/lerobot/calibration/robots/so100_follower/follower_R.json",
+            calibration_file="/home/jihyun/.cache/huggingface/lerobot/calibration/robots/so_follower/follower_left.json",
             robot_controller="joint_pos",
         )
     )
 
     gripper: str | None = None
 
-    teleop: str = "SoArm"
+    teleop: str = "SoArm"  # Right arm
     teleop_cfg: NodeCfg = field(
         default_factory=lambda: NodeCfg(
-            port="/dev/ttyACM1",
+            port="/dev/ttyACM3",
             motors_enabled=False,
             robot_model="so100",
             robot_controller="joint_pos",
-            calibration_file="/home/portegak/.cache/huggingface/lerobot/calibration/robots/so100_follower/leader_L.json",
+            calibration_file="/home/jihyun/.cache/huggingface/lerobot/calibration/teleoperators/so_leader/leader_right.json",
         )
     )
 
     teleop2: str | None = "SoArm"
     teleop2_cfg: NodeCfg = field(
         default_factory=lambda: NodeCfg(
-            port="/dev/ttyACM3",
+            port="/dev/ttyACM0",
             motors_enabled=False,
             robot_model="so100",
             robot_controller="joint_pos",
-            calibration_file="/home/portegak/.cache/huggingface/lerobot/calibration/robots/so100_follower/leader_R.json",
+            calibration_file="/home/jihyun/.cache/huggingface/lerobot/calibration/teleoperators/so_leader/leader_left.json",
         )
     )
 

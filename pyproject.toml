@@ -23,7 +23,7 @@ requires-python = ">=3.10"
 
 dependencies = [
     "loguru>=0.7.3",
-    "rio_hw[all] @ git+https://github.com/robot-i-o/rio-hw.git@main",
+    "rio_hw[all]",
     # PyPI 0.1.0 predates force_direct_encoding; pin the implementation we test.
     "robodm @ git+https://github.com/BerkeleyAutomation/robodm.git@f60b3f9cdb5393190cd2d51e238d31002bc2d39a",
     "av==14.2.0",  # tested robodm version; 14.3/14.4 lack Linux wheels
@@ -48,6 +48,9 @@ docs = [
     "mkdocs-autorefs",
     "mkdocs-multirepo-plugin @ git+https://github.com/etaoxing/mkdocs-multirepo-plugin.git@fb846d34672fd7f86ad5ba680566817a9ea7fb25",
 ]
+
+[tool.uv.sources]
+rio_hw = { path = "third_party/rio-hw", editable = true }
 
 # This removes version constraints from transitive dependencies
 [tool.uv]
