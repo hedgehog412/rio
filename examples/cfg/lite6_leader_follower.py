@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from math import isfinite
 
 from rio.cfg import Camera, NodeCfg, VisualizerCfg
 from rio.cfg.common import RecorderCfg
@@ -16,7 +17,7 @@ class Lite6LeaderFollowerStation:
             robot_controller="joint_pos",
             # NumPy 2 float32 duration arithmetic can round epoch timestamps.
             dtype="float64",
-            max_motor_speed=0.20,
+            max_motor_speed=3.1415,
             joints_lowpass_alpha=0.2,
             freq=250,
         )
@@ -88,8 +89,11 @@ class Lite6LeaderFollowerStation:
     mw: str = "Thread"
     mp_method: str = "spawn"
 
-    # Outer leader-follower loop
-    freq: int = 15
+    # Restore the XArm driver's normal finite ceiling (rad/s in joint space).
+    follower_max_motor_speed: float = 3.1415
+
+    # Target updates; the arm nodes continue to run their servo loops at 250 Hz.
+    freq: int = 50
 
     action_space: str = "JOINT_POS"
     embodiment_type: str = "SINGLE_ARM"
@@ -113,3 +117,10 @@ class Lite6LeaderFollowerStation:
             verbose=True,
         )
     )
+
+    def __post_init__(self):
+        if not isfinite(self.follower_max_motor_speed) or not 0 < self.follower_max_motor_speed <= 3.1415:
+            raise ValueError("follower_max_motor_speed must be finite and in (0, 3.1415] rad/s.")
+        if not 1 <= self.freq <= 250:
+            raise ValueError("freq must be between 1 and 250 Hz.")
+        self.arm_cfg.cfg["max_motor_speed"] = self.follower_max_motor_speed
