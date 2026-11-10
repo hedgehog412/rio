@@ -14,6 +14,8 @@ class Lite6LeaderFollowerStation:
             robot_ip="192.168.2.176",
             robot_model="lite6",
             robot_controller="joint_pos",
+            # NumPy 2 float32 duration arithmetic can round epoch timestamps.
+            dtype="float64",
             max_motor_speed=0.20,
             joints_lowpass_alpha=0.2,
             freq=250,

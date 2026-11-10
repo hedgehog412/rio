@@ -28,6 +28,8 @@ Confirm the settings in `examples/cfg/lite6_leader_follower.py` match the workst
 
 The loop defaults to 15 Hz, with 30 Hz camera acquisition. Recording samples camera observations at the outer loop rate. Gello-specific leader smoothing is disabled for this real-arm setup; the follower's configured joint filter remains enabled. Hardware addresses and camera configurations are fixed CLI fields, so edit the station file if they need changing.
 
+The follower uses `dtype="float64"`. With NumPy 2, a speed-limited duration calculated from float32 joint data can cause an epoch timestamp to be evaluated in float32, rounding it by many seconds. This can trigger `Times must be monotonically increasing` or schedule a waypoint far from its intended arrival time. The station's float64 configuration preserves timestamp precision through the existing driver without changing its speed limit or removing timestamp checks. The regression test uses the actual driver interpolator and verifies arrival times for timestamps that float32 would round both backward and forward.
+
 ## Teleoperation without recording
 
 ```bash
