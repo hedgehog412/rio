@@ -35,7 +35,7 @@ except (ImportError, Exception):
     _gpu_available = False
 
 
-def step_to_dict(step: Step) -> dict[str, Any]:
+def step_to_dict(step: Step | dict[str, Any]) -> dict[str, Any]:
     """
     Convert a Step object into a flat dictionary suitable for recording.
 
@@ -81,10 +81,11 @@ class Recorder(Node):
         path: str,
         video_codec: str = "libx264",
         codec_options: dict[str, Any] | None = None,
-        raw_codec: str = "rawvideo_pyarrow",
+        raw_codec: str = "rawvideo",
         start_recording: bool = True,
         log_stats: bool = False,
         system_stats_freq: int = 1,
+        direct_encoding: bool = False,
         *,
         freq: int = 100,
         max_buffer_size: int = 100,
@@ -93,6 +94,10 @@ class Recorder(Node):
     ):
         """
         Initialize the Recorder node.
+
+        Args:
+            direct_encoding: Encode images during recording instead of at save
+                time. All feature names must be present in the first step.
         """
         self.base_path = path
         self.video_codec = video_codec
@@ -105,6 +110,8 @@ class Recorder(Node):
         self.start_recording = start_recording
         self.log_stats = log_stats
         self.system_stats_freq = system_stats_freq
+        self.direct_encoding = direct_encoding
+        self._direct_features: set[str] | None = None
         self.last_stats_time = 0.0
 
         if max_queue_size is None:
@@ -123,7 +130,6 @@ class Recorder(Node):
     def __post_init__(self):
         """Initialize the robodm Trajectory and set up the node."""
         # Initialize robodm Trajectory in write mode
-        # Try to use raw_codec if supported, otherwise fall back to basic initialization
         self._init_dataset()
 
         self.example_request = {
@@ -145,22 +151,16 @@ class Recorder(Node):
 
     def _create_datamanager(self):
         """Create the robodm Trajectory datamanager."""
-        try:
-            self.datamanager = robodm.Trajectory(
-                path=self.path,
-                mode="w",
-                video_codec=self.video_codec,
-                codec_options=self.codec_options,
-                raw_codec=self.raw_codec,
-            )
-        except TypeError:
-            # Fall back for older robodm versions without raw_codec support
-            self.datamanager = robodm.Trajectory(
-                path=self.path,
-                mode="w",
-                video_codec=self.video_codec,
-                codec_options=self.codec_options,
-            )
+        if robodm is None:
+            raise ImportError("robodm is required for recording; run uv sync.")
+        self.datamanager = robodm.Trajectory(
+            path=self.path,
+            mode="w",
+            video_codec=self.video_codec,
+            codec_options=self.codec_options,
+            raw_codec=self.raw_codec,
+        )
+        self._direct_features = None
 
     def _init_stats(self):
         self.stats = {
@@ -392,7 +392,40 @@ class Recorder(Node):
             return
 
         try:
-            self.datamanager.add_by_dict(state, timestamp=timestamp, time_unit=self.time_unit)
+            if self.datamanager is None:
+                raise RuntimeError("No trajectory has been initialized.")
+            timestamp_ms = (
+                None if timestamp is None else self.datamanager.time_manager.convert_units(timestamp, self.time_unit, "ms")
+            )
+            if self.video_codec == "rawvideo":
+                state = step_to_dict(state)
+                # robodm's newer auto-selector otherwise substitutes H.265 for
+                # explicit rawvideo RGB data. Keep RIO's lossless raw mode.
+                self.datamanager.codec_config.feature_codecs.update(dict.fromkeys(state, "rawvideo"))
+            if self.direct_encoding:
+                assert robodm is not None
+                state = step_to_dict(state)
+                features = set(state)
+                if self._direct_features is None:
+                    if not state:
+                        return
+                    # Register every stream before writing the first packet. Adding
+                    # streams later makes robodm recreate the container, which can
+                    # lose buffered video frames and reset encoder settings.
+                    self.datamanager.init_feature_streams(
+                        {key: robodm.FeatureType.from_data(value) for key, value in state.items()}
+                    )
+                    self._direct_features = features
+                elif features - self._direct_features:
+                    raise ValueError("Direct encoding requires all feature names in the first step; start a new trajectory.")
+                self.datamanager.add_by_dict(
+                    state,
+                    timestamp=timestamp_ms,
+                    time_unit="ms",
+                    force_direct_encoding=True,
+                )
+            else:
+                self.datamanager.add_by_dict(state, timestamp=timestamp_ms, time_unit="ms")
         except Exception as e:
             logger.error(f"Error recording dict: {e}")
 
@@ -412,7 +445,9 @@ class Recorder(Node):
                 self._put_status()
 
                 logger.warning("Recorder saving trajectory DO NOT INTERRUPT...")
-                self.datamanager.close()
+                # Direct mode already encoded every stream; avoid a second pass
+                # and the temporary copy made by robodm's compaction path.
+                self.datamanager.close(compact=not self.direct_encoding and self.video_codec != "rawvideo")
                 logger.info(f"Recorder saved trajectory to {self.path}")
 
                 self.last_saved_path = self.path

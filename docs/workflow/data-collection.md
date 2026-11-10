@@ -36,6 +36,9 @@ Set `recorder = None` to disable recording during testing:
 recorder: str | None = None
 ```
 
+For lower temporary disk use, try the opt-in
+[direct video encoding](direct-encoding.md) recorder option and its hardware-free benchmark.
+
 ## Run Teleoperation for Data Collection
 
 Select your station by setting `STATION=<ClassName>` before running. Run `uv run -m examples.cfg` to list all registered stations. Override any config field at the command line via tyro.
