@@ -26,7 +26,7 @@ Confirm the settings in `examples/cfg/lite6_leader_follower.py` match the workst
 - RealSense serial: `238222074772`.
 - Gphoto ports: left `usb:001,048`, right `usb:001,033`. USB bus/device numbers can change after reconnecting; check with `gphoto2 --auto-detect`.
 
-The loop defaults to 15 Hz, with 30 Hz camera acquisition. Recording samples camera observations at the outer loop rate. Hardware addresses and camera configurations are fixed CLI fields, so edit the station file if they need changing.
+The loop defaults to 15 Hz, with 30 Hz camera acquisition. Recording samples camera observations at the outer loop rate. Gello-specific leader smoothing is disabled for this real-arm setup; the follower's configured joint filter remains enabled. Hardware addresses and camera configurations are fixed CLI fields, so edit the station file if they need changing.
 
 ## Teleoperation without recording
 

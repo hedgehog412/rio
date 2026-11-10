@@ -76,7 +76,8 @@ class Lite6LeaderFollowerStation:
 
     check_alignment: bool = True
     invert_gripper: bool = False
-    use_leader_smoothing: bool = True
+    # Real XArm leaders use the follower's joint filter, not the Gello helper.
+    use_leader_smoothing: bool = False
     startup_delay: float = 1.0
 
     arm_latency: float = 0.0
