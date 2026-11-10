@@ -96,7 +96,8 @@ def teleop_leader_follower(args, env, teleop, teleop2=None, buttons=None, visual
             # Read leader state
             teleop_state = teleop.get_state()
             joint_q = teleop_state["joint_q"]
-            gripper_pos = teleop_state["gripper_position"]
+            # gripper_pos = teleop_state["gripper_position"]
+            gripper_pos = teleop_state.get("gripper_position", 0.0)
 
             if getattr(args, "invert_gripper", False) and gripper_pos is not None:
                 gripper_pos = 1 - gripper_pos

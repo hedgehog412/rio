@@ -6,6 +6,7 @@ from .so100 import SO100Station
 from .xarm_eef import Xarm7EEFStation
 from .xarm_gello import Xarm7GelloStation
 from .yam_station import YamStation
+from .lite6_leader_follower import Lite6LeaderFollowerStation
 
 __all__ = [
     "BimanualSO100Station",
@@ -15,4 +16,5 @@ __all__ = [
     "Xarm7EEFStation",
     "Xarm7GelloStation",
     "YamStation",
+    "Lite6LeaderFollowerStation",
 ]
