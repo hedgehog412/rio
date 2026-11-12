@@ -40,6 +40,10 @@ recorder: str | None = None
 
 Select your station by setting `STATION=<ClassName>` before running. Run `uv run -m examples.cfg` to list all registered stations. Override any config field at the command line via tyro.
 
+For Huion Inspiroy 2 drawing on a Lite 6, use the dedicated
+[tablet drawing entry point](../hardware/teleop/huion.md), which provides device discovery,
+paper calibration, a robot-free preview, and Cartesian data collection.
+
 === "XArm7 + Spacemouse / Gamepad / Keyboard"
 
     Control the robot in Cartesian space (EEF delta):

@@ -2,19 +2,21 @@ from .bimanual_so100 import BimanualSO100Station
 from .bimanual_yam_station import BimanualYamStation
 from .cameras import CameraStation
 from .humanoid import G1Station
+from .lite6_leader_follower import Lite6LeaderFollowerStation
+from .lite6_tablet import Lite6TabletStation
 from .so100 import SO100Station
 from .xarm_eef import Xarm7EEFStation
 from .xarm_gello import Xarm7GelloStation
 from .yam_station import YamStation
-from .lite6_leader_follower import Lite6LeaderFollowerStation
 
 __all__ = [
     "BimanualSO100Station",
     "BimanualYamStation",
     "G1Station",
+    "Lite6LeaderFollowerStation",
+    "Lite6TabletStation",
     "SO100Station",
     "Xarm7EEFStation",
     "Xarm7GelloStation",
     "YamStation",
-    "Lite6LeaderFollowerStation",
 ]

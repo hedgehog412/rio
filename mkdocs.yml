@@ -118,6 +118,7 @@ nav:
   # - Hardware: '!import git@github.com:robot-i-o/rio-hw.git?branch=main&docs_dir=docs/' # TODO: fix in rio-hw
 
   - Setup Tutorials:
+    - Huion Tablet Drawing: hardware/teleop/huion.md
     - Humanoid Control: setup-tutorials/humanoid.md
     - Ubuntu RT Setup: setup-tutorials/ubuntu.md
 
