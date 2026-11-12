@@ -102,7 +102,7 @@ Configure the pen's actual payload in Studio so gravity compensation is appropri
 
 Edit `tip_offset_mm` near the top of `examples/cfg/lite6_tablet.py` to set the measured
 TCP-to-pen-tip vector `(X, Y, Z)`. Calibration reads this file automatically; no offset
-command-line arguments or interactive offset entry are needed. The default `None`
+command-line arguments or interactive offset entry are needed. Setting it to `None`
 means the offset is unknown. All three values are in **millimeters in the reported
 TCP's local coordinate frame**, not world coordinates. A scalar pen length is enough
 only when its direction along that frame's axes is also known. If Studio's TCP is
@@ -115,45 +115,57 @@ uv run -m examples.teleop_tablet calibrate \
   --robot-ip 192.168.2.176 --output paper.json
 ```
 
-In this mode the wrist may rotate freely between the three contact points. The code
+In this mode the wrist may rotate freely between contact points. The code
 computes each tip position as `p_tip = p_tcp + R_tcp @ offset`, then converts the
 three contacts into drawing targets at the **last taught orientation**. Choose the
-desired drawing angle at the final corner; that angle stays fixed during drawing.
+desired drawing angle at the final contact; that angle stays fixed during drawing.
 The offset is saved in `paper.json` as `tip_offset_m` for provenance. The program does
 not change Studio's TCP configuration. Do not apply a flange-to-tip offset again if
 Studio has already applied it to the reported TCP.
 
-### Paper height and per-corner consistency
+### Paper height and surface consistency
 
-The measured offset does not replace touching the paper. The three marked corners
-still establish its actual height, tilt, position, and drawing area. Raw TCP Z is not
+The measured offset does not replace touching the paper. Contact samples still
+establish its actual height, tilt, and position; three corners define the drawing
+area. Raw TCP Z is not
 directly comparable to a local TCP-to-tip Z offset; the offset must first be rotated
 into the robot base frame. Corners on a tilted sheet may legitimately have different Z.
 
-With a known offset, calibration defaults to **two contacts at each marked corner**.
-Between contacts, change the wrist tilt and return the tip to the exact same mark.
-Edit these settings in `examples/cfg/lite6_tablet.py`:
+With a known offset, the default workflow requires **no exact-point repeats**:
+
+1. Touch the origin/top-left, top-right, and bottom-left of the drawing area once.
+2. Touch three other distinct points anywhere inside that area, keeping the tip in
+   light contact with the sheet. You do not need to enter or reproduce their XYZ.
+3. At the last contact, choose the wrist orientation to keep during drawing.
+
+The code computes tip positions using the measured offset and fits a plane through
+all six contacts. It reports each contact's perpendicular distance from that plane,
+plus the maximum and RMS residual. The first three corners are projected onto the
+fitted plane to map the tablet's drawing area. Different XY locations and wrist
+angles are permitted; paper contact supplies the surface constraint.
+
+Edit these settings near the bottom of `examples/cfg/lite6_tablet.py`:
 
 ```python
-calibration_repeats: int = 2
-calibration_max_discrepancy_mm: float = 2.0
+calibration_mode: str = "plane"
+calibration_surface_samples: int = 3
+calibration_plane_tolerance_mm: float = 2.0
 ```
 
-For each corner, calibration reports the maximum pairwise XYZ distance and the Z
-spread between its computed tip positions. If any corner exceeds the configured
-XYZ tolerance, it reports all three corners and refuses to overwrite `paper.json`.
-Check the contact locations, rigid mounting, and measured offset; edit `tip_offset_mm`
-and rerun when the offset is wrong. The program does not automatically alter that
-physical measurement. Raw contact poses, tip positions, and discrepancy statistics
-are saved in `contact_checks` when validation succeeds.
+`calibration_surface_samples` is the number of additional contacts after the three
+corners and must be at least one. If any point exceeds the plane tolerance, calibration
+reports the residuals and refuses to overwrite `paper.json`. Check contact, sheet
+flatness, mounting, and the measured offset. Raw poses, tip positions, and plane-fit
+statistics are saved in `surface_fit`. The program does not auto-adjust the offset.
 
-Three distinct points always define a plane, so their plane-fit residual alone cannot
-validate the tip offset. Repeated contacts test consistency, not absolute accuracy:
-the same wrist angle at every repeat can hide a common offset error. Pure spin about
-the pen axis also cannot expose an axial length error; use different tilts. The final
-accepted contact at each corner defines the plane, and the final sample's orientation
-is used for drawing. Setting `calibration_repeats = 1` disables the repeated-contact
-check; it is also unavailable in the legacy unknown-offset mode.
+Three noncollinear points always define a plane, which is why extra contacts are used
+to check surface consistency. Even a good fit cannot prove absolute tip-offset accuracy:
+a common offset error can look like a different paper height or tilt. Keep the offset
+based on a physical measurement and use the air-gap motion test before drawing.
+
+The older exact-point check remains optional with `calibration_mode = "repeat"`.
+Only that mode uses `calibration_repeats` and `calibration_max_discrepancy_mm` near the
+top of the configuration. Its raw contacts and statistics are saved in `contact_checks`.
 
 An optional `--tip-offset-mm X Y Z` overrides the file for one invocation. If both the
 file setting and the override are absent, calibration retains the legacy assumption of a constant

@@ -111,12 +111,22 @@ def calibrate(args):
     tip_offset = None if offset_mm is None else np.asarray(offset_mm, dtype=float) * 0.001
     if tip_offset is not None and (tip_offset.shape != (3,) or not np.isfinite(tip_offset).all()):
         raise ValueError("tip_offset_mm requires three finite numbers in the reported TCP frame.")
-    repeats = getattr(station, "calibration_repeats", 2) if tip_offset is not None else 1
-    tolerance_mm = getattr(station, "calibration_max_discrepancy_mm", 2.0)
+    mode = getattr(station, "calibration_mode", "plane") if tip_offset is not None else "legacy"
+    if mode not in ("plane", "repeat", "legacy"):
+        raise ValueError("calibration_mode must be 'plane' or 'repeat'.")
+    repeats = getattr(station, "calibration_repeats", 2) if mode == "repeat" else 1
+    extra_contacts = getattr(station, "calibration_surface_samples", 3) if mode == "plane" else 0
+    tolerance_mm = (
+        getattr(station, "calibration_plane_tolerance_mm", 2.0)
+        if mode == "plane"
+        else getattr(station, "calibration_max_discrepancy_mm", 2.0)
+    )
     if not isinstance(repeats, int) or repeats < 1:
         raise ValueError("calibration_repeats must be a positive integer.")
     if not np.isfinite(tolerance_mm) or tolerance_mm <= 0:
-        raise ValueError("calibration_max_discrepancy_mm must be finite and positive.")
+        raise ValueError("Calibration discrepancy tolerance must be finite and positive.")
+    if mode == "plane" and (not isinstance(extra_contacts, int) or extra_contacts < 1):
+        raise ValueError("calibration_surface_samples must be a positive integer.")
     arm = XArmAPI(args.robot_ip, is_radian=True, do_not_open=True)
     poses = []
     groups = []
@@ -145,14 +155,24 @@ def calibrate(args):
         else:
             print(
                 f"TCP-to-tip offset: {offset_mm} mm in the reported TCP frame. Wrist orientation may change.\n"
-                "Choose the desired drawing orientation at the LAST corner; drawing will keep that orientation."
+                "Choose the desired drawing orientation at the LAST contact; drawing will keep that orientation."
             )
             if repeats > 1:
                 print(
                     f"Re-touch each marked corner {repeats} times, changing wrist tilt but keeping the tip at the SAME point.\n"
                     f"Maximum permitted tip-position discrepancy per corner: {tolerance_mm:g} mm."
                 )
-        for label in ("origin (tablet top-left)", "+U corner (tablet top-right)", "+V corner (tablet bottom-left)"):
+            elif mode == "plane":
+                print(
+                    f"After the three corners, touch {extra_contacts} distinct points anywhere INSIDE the drawing area.\n"
+                    f"No exact-point repeats: maximum fitted-plane residual is {tolerance_mm:g} mm per contact."
+                )
+        labels = ["origin (tablet top-left)", "+U corner (tablet top-right)", "+V corner (tablet bottom-left)"]
+        labels += [
+            f"additional surface point {i + 1}/{extra_contacts} (different position INSIDE drawing area)"
+            for i in range(extra_contacts)
+        ]
+        for label in labels:
             group = []
             for repeat in range(repeats):
                 input(f"Place pen in light contact at {label} ({repeat + 1}/{repeats}), then press Enter: ")
@@ -197,7 +217,13 @@ def calibrate(args):
             arm.disconnect()
     if hold_error is not None:
         raise RuntimeError(f"Calibration not saved because restoring position hold failed: {hold_error}")
-    if tip_offset is not None and repeats > 1:
+    if tip_offset is not None and mode == "plane":
+        calibration = PaperCalibration.from_surface_contacts(poses, tip_offset, tolerance_mm * 0.001)
+        fit = calibration.surface_fit or {}
+        for i, residual in enumerate(fit["point_residuals_mm"]):
+            print(f"Surface point {i + 1}: distance to fitted paper plane = {residual:+.3f} mm")
+        print(f"Plane fit: max={fit['max_abs_residual_mm']:.3f} mm; RMS={fit['rms_residual_mm']:.3f} mm")
+    elif tip_offset is not None and repeats > 1:
         calibration = PaperCalibration.from_repeated_contacts(groups, tip_offset, tolerance_mm * 0.001)
         for check in calibration.contact_checks or []:
             print(

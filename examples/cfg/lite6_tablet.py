@@ -11,8 +11,8 @@ class Lite6TabletStation:
     # EDIT HERE: measured TCP-to-pen-tip (X, Y, Z), in mm in the reported TCP frame.
     # None = unknown offset (legacy fixed-orientation teaching).
     # Use (0.0, 0.0, 0.0) only if Studio already reports the physical pen-tip TCP.
-    tip_offset_mm: tuple[0.0, 0.0, 184.] | None = None
-    # Re-touch each marked corner with a different wrist tilt to check the offset.
+    tip_offset_mm: tuple[float, float, float] | None = (0.0, 0.0, 184.0)
+    # Optional "repeat" mode only: re-touch each marked corner with a different wrist tilt.
     calibration_repeats: int = 2
     # Maximum pairwise distance between computed tips at the SAME physical corner.
     calibration_max_discrepancy_mm: float = 2.0
@@ -42,3 +42,8 @@ class Lite6TabletStation:
     action_space: str = "task_pos"
     embodiment_type: str = "SINGLE_ARM"
     instruction: str = "Draw on the paper following the stylus."
+
+    # Default: three drawing corners, then distinct extra contacts inside the area.
+    calibration_mode: str = "plane"  # "repeat" optionally checks the same marked corners.
+    calibration_surface_samples: int = 3
+    calibration_plane_tolerance_mm: float = 2.0

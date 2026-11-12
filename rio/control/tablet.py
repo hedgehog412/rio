@@ -41,6 +41,7 @@ class PaperCalibration:
     tablet_bounds: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
     tip_offset_m: list[float] | None = None
     contact_checks: list[dict] | None = None
+    surface_fit: dict | None = None
 
     def __post_init__(self):
         points = np.asarray([self.origin, self.corner_u, self.corner_v, self.rotvec], dtype=float)
@@ -52,6 +53,10 @@ class PaperCalibration:
             offset = np.asarray(self.tip_offset_m, dtype=float)
             if offset.shape != (3,) or not np.isfinite(offset).all():
                 raise ValueError("tip_offset_m must be a finite three-element vector.")
+        if self.surface_fit is not None:
+            residual = self.surface_fit.get("max_abs_residual_mm", 0.0)
+            if not np.isfinite(residual) or residual < 0:
+                raise ValueError("Surface fit residual must be finite and nonnegative.")
         a, b = points[1] - points[0], points[2] - points[0]
         lengths = np.linalg.norm(a), np.linalg.norm(b)
         if min(lengths) < 0.005 or np.linalg.norm(np.cross(a, b)) / np.prod(lengths) < 0.1:
@@ -90,7 +95,12 @@ class PaperCalibration:
         if angle > np.deg2rad(3):
             raise ValueError("Start orientation differs from calibration by more than 3 degrees; align the pen first.")
         u, v, h = self.coordinates(pose[:3])
-        if not (-0.01 <= u <= 1.01 and -0.01 <= v <= 1.01 and -0.0005 <= h <= clearance + 0.05):
+        # The final measured contact may sit just below an averaged plane. The
+        # controller's first movement is a gated vertical lift, never lateral.
+        start_tolerance = 0.0005
+        if self.surface_fit is not None:
+            start_tolerance = max(start_tolerance, self.surface_fit.get("max_abs_residual_mm", 0.0) * 0.001 + 0.0001)
+        if not (-0.01 <= u <= 1.01 and -0.01 <= v <= 1.01 and -start_tolerance <= h <= clearance + 0.05):
             raise ValueError("Start TCP must be over the calibrated rectangle, on or above its contact plane.")
 
     def save(self, path: str | Path):
@@ -169,6 +179,59 @@ class PaperCalibration:
             )
         calibration = cls.from_contact_poses(last_poses, offset)
         calibration.contact_checks = checks
+        return calibration
+
+    @classmethod
+    def from_surface_contacts(
+        cls, poses: list[np.ndarray], tip_offset_m: np.ndarray, max_residual_m: float = 0.002
+    ) -> "PaperCalibration":
+        """Fit a paper plane from distinct contacts; the first three map the area.
+
+        Remaining contacts may be anywhere inside that area. Every computed tip
+        should lie near the fitted plane; no repeated XYZ location is required.
+        This checks planarity, not absolute accuracy of the supplied tip offset.
+        """
+        contacts = np.asarray(poses, dtype=float)
+        offset = np.asarray(tip_offset_m, dtype=float)
+        if contacts.ndim != 2 or contacts.shape[0] < 4 or contacts.shape[1] != 6 or not np.isfinite(contacts).all():
+            raise ValueError("Surface calibration requires at least four finite six-element contact poses.")
+        if offset.shape != (3,) or not np.isfinite(offset).all():
+            raise ValueError("tip_offset_m must be a finite three-element vector.")
+        if not np.isfinite(max_residual_m) or max_residual_m <= 0:
+            raise ValueError("Maximum plane residual must be finite and positive.")
+        rotations = Rotation.from_rotvec(contacts[:, 3:])
+        tips = contacts[:, :3] + rotations.apply(np.tile(offset, (len(contacts), 1)))
+        center = tips.mean(axis=0)
+        _, singular, vh = np.linalg.svd(tips - center, full_matrices=False)
+        if singular[1] <= max(singular[0] * 1e-3, 1e-6):
+            raise ValueError("Surface contacts must span an area, not a line.")
+        normal = vh[-1]
+        if normal[2] < 0:
+            normal = -normal
+        residuals = (tips - center) @ normal
+        maximum = float(np.abs(residuals).max())
+        if maximum > max_residual_m + 1e-12:
+            details = ", ".join(f"point {i + 1}: {r * 1000:+.3f} mm" for i, r in enumerate(residuals))
+            raise ValueError(
+                f"Paper-plane residual exceeds {max_residual_m * 1000:g} mm. {details}. "
+                "Check contact, paper flatness, and tip offset; calibration was not saved."
+            )
+        # The three projected anchors map the drawing area. Commands use the final
+        # wrist orientation and the same offset as the measured contact poses.
+        anchors = tips[:3] - residuals[:3, None] * normal
+        targets = anchors - rotations[-1].apply(offset)
+        calibration = cls(*targets.tolist(), rotvec=contacts[-1, 3:].tolist(), tip_offset_m=offset.tolist())
+        calibration.surface_fit = {
+            "samples": len(contacts),
+            "max_abs_residual_mm": maximum * 1000,
+            "rms_residual_mm": float(np.sqrt(np.mean(residuals**2))) * 1000,
+            "tolerance_mm": max_residual_m * 1000,
+            "point_residuals_mm": (residuals * 1000).tolist(),
+            "normal_base": normal.tolist(),
+            "centroid_tip_m": center.tolist(),
+            "contact_poses_m_rad": contacts.tolist(),
+            "tip_positions_m": tips.tolist(),
+        }
         return calibration
 
     @classmethod

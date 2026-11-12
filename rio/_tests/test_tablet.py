@@ -179,6 +179,58 @@ def test_repeated_contacts_require_positive_finite_tolerance(repeated_contacts, 
         PaperCalibration.from_repeated_contacts(groups, offset, tolerance)
 
 
+@pytest.fixture
+def surface_contacts(paper):
+    uv = np.array([[0, 0], [1, 0], [0, 1], [0.25, 0.25], [0.75, 0.65], [0.5, 0.5]])
+    tips = np.asarray(paper.origin) + uv @ paper.axes.T
+    offset = np.array([0.012, -0.007, 0.1])
+    rotations = Rotation.from_euler(
+        "xyz", [[0, 0, 0], [10, 25, 30], [-20, 10, 40], [15, -15, 20], [20, 10, 30], [-10, 20, -40]], degrees=True
+    )
+    poses = np.column_stack((tips - rotations.apply(np.tile(offset, (6, 1))), rotations.as_rotvec()))
+    return offset, poses, tips
+
+
+def test_surface_fit_accepts_distinct_points_and_recovers_tilted_paper(paper, surface_contacts, tmp_path):
+    offset, poses, tips = surface_contacts
+    calibration = PaperCalibration.from_surface_contacts(list(poses), offset)
+    fit = calibration.surface_fit
+    assert fit is not None and fit["samples"] == 6
+    assert fit["max_abs_residual_mm"] < 1e-9
+    targets = np.asarray([calibration.origin, calibration.corner_u, calibration.corner_v])
+    np.testing.assert_allclose(targets + Rotation.from_rotvec(calibration.rotvec).apply(offset), tips[:3], atol=1e-12)
+    np.testing.assert_allclose(calibration.normal, paper.normal, atol=1e-12)
+    calibration.validate_start(poses[-1], 0.005)
+    calibration.save(tmp_path / "surface.json")
+    assert PaperCalibration.load(tmp_path / "surface.json").surface_fit == fit
+
+
+def test_surface_fit_rejects_a_contact_far_from_paper(paper, surface_contacts):
+    offset, poses, _ = surface_contacts
+    poses[-1, :3] += 0.01 * paper.normal
+    with pytest.raises(ValueError, match="Paper-plane residual exceeds"):
+        PaperCalibration.from_surface_contacts(list(poses), offset)
+
+
+def test_surface_fit_allows_initial_lift_from_contact_below_averaged_plane(paper, surface_contacts):
+    offset, poses, _ = surface_contacts
+    poses[-1, :3] -= 0.0015 * paper.normal
+    calibration = PaperCalibration.from_surface_contacts(list(poses), offset)
+    assert calibration.coordinates(poses[-1, :3])[2] < -0.0005
+    controller = DrawingController(calibration, poses[-1], draw_height=0.01)
+    commands, phases = drain(controller)
+    assert all(phase == "lift" for phase in phases)
+    local = np.array([calibration.coordinates(command[:3]) for command in commands])
+    np.testing.assert_allclose(local[:, :2], np.tile(local[0, :2], (len(local), 1)), atol=1e-12)
+    assert local[-1, 2] == pytest.approx(0.015)
+
+
+def test_surface_fit_rejects_collinear_contacts():
+    poses = [np.array([i * 0.05, 0, 0, 0, 0, 0]) for i in range(4)]
+    with pytest.raises(ValueError, match="span an area"):
+        PaperCalibration.from_surface_contacts(poses, np.zeros(3))
+
+
 def test_tablet_crop_rejects_outside_and_maps_corners(paper):
     paper.tablet_bounds = (0.1, 0.2, 0.9, 0.8)
     assert paper.map_sample(TabletSample(0.05, 0.5, True)) is None
@@ -472,6 +524,10 @@ def test_calibration_hand_guides_then_holds_and_converts_sdk_units(paper, tmp_pa
     )
     monkeypatch.setattr(xarm.wrapper, "XArmAPI", lambda *_, **__: arm)
     monkeypatch.setattr("builtins.input", lambda _: "")
+    monkeypatch.setattr(
+        "examples.cfg.lite6_tablet.Lite6TabletStation",
+        lambda: SimpleNamespace(tip_offset_mm=(0, 0, 0), calibration_mode="repeat", calibration_repeats=1),
+    )
     output = tmp_path / "paper.json"
     calibrate(argparse.Namespace(robot_ip="fake", output=output, flip_normal=False))
     taught = PaperCalibration.load(output)
@@ -512,7 +568,9 @@ def test_calibrate_with_tip_offset_accepts_rotated_contacts(paper, tmp_path, mon
     monkeypatch.setattr("builtins.input", lambda _: "")
     monkeypatch.setattr(
         "examples.cfg.lite6_tablet.Lite6TabletStation",
-        lambda: SimpleNamespace(tip_offset_mm=offset_mm.tolist() if offset_source == "file" else [0, 0, 0]),
+        lambda: SimpleNamespace(
+            tip_offset_mm=offset_mm.tolist() if offset_source == "file" else [0, 0, 0], calibration_mode="repeat"
+        ),
     )
     output = tmp_path / "paper.json"
     calibrate(
@@ -547,11 +605,41 @@ def test_failed_repeat_check_preserves_existing_calibration(repeated_contacts, t
     )
     monkeypatch.setattr(xarm.wrapper, "XArmAPI", lambda *_, **__: arm)
     monkeypatch.setattr("builtins.input", lambda _: "")
+    monkeypatch.setattr(
+        "examples.cfg.lite6_tablet.Lite6TabletStation", lambda: SimpleNamespace(tip_offset_mm=None, calibration_mode="repeat")
+    )
     output = tmp_path / "paper.json"
     output.write_text("previous calibration")
     with pytest.raises(ValueError, match="Contact discrepancy exceeds"):
         calibrate(argparse.Namespace(robot_ip="fake", output=output, flip_normal=False, tip_offset_mm=(offset * 1000).tolist()))
     assert output.read_text() == "previous calibration"
+
+
+def test_calibration_plane_mode_uses_distinct_surface_contacts(surface_contacts, tmp_path, monkeypatch):
+    offset, poses, _ = surface_contacts
+    sdk_poses = poses.copy()
+    sdk_poses[:, :3] *= 1000
+    samples = iter(sdk_poses)
+    arm = SimpleNamespace(
+        connect=lambda: None,
+        disconnect=lambda: None,
+        get_err_warn_code=lambda: (0, [0, 0]),
+        get_is_moving=lambda: False,
+        motion_enable=lambda _: 0,
+        set_mode=lambda _: 0,
+        set_state=lambda _: 0,
+        get_position_aa=lambda **_: (0, next(samples).tolist()),
+    )
+    monkeypatch.setattr(xarm.wrapper, "XArmAPI", lambda *_, **__: arm)
+    monkeypatch.setattr("builtins.input", lambda _: "")
+    monkeypatch.setattr(
+        "examples.cfg.lite6_tablet.Lite6TabletStation", lambda: SimpleNamespace(tip_offset_mm=(offset * 1000).tolist())
+    )
+    output = tmp_path / "paper.json"
+    calibrate(argparse.Namespace(robot_ip="fake", output=output, flip_normal=False))
+    calibration = PaperCalibration.load(output)
+    assert calibration.surface_fit is not None and calibration.surface_fit["samples"] == 6
+    assert calibration.contact_checks is None
 
 
 @pytest.mark.parametrize("failure", [KeyboardInterrupt, RuntimeError])
