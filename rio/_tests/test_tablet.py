@@ -12,6 +12,7 @@ import pytest
 import rio_hw.middleware
 import rio_hw.time
 import xarm.wrapper
+from scipy.spatial.transform import Rotation
 
 import examples.teleop_tablet as entrypoint
 import rio.envs.env
@@ -72,6 +73,54 @@ def test_mapping_tilted_plane_and_round_trip(paper, tmp_path):
     mapped = loaded.map_sample(TabletSample(0.25, 0.75, True))
     assert mapped is not None
     np.testing.assert_allclose(mapped, surface)
+
+
+def test_known_tip_offset_compensates_arbitrary_teaching_orientations(paper, tmp_path):
+    tips = np.asarray([paper.origin, paper.corner_u, paper.corner_v])
+    rotations = Rotation.from_euler("xyz", [[0, 0, 0], [35, -20, 10], [-15, 40, 80]], degrees=True)
+    offset = np.array([0.012, -0.007, 0.1])
+    contacts = np.column_stack((tips - rotations.apply(np.tile(offset, (3, 1))), rotations.as_rotvec()))
+    calibration = PaperCalibration.from_contact_poses(list(contacts), offset)
+    targets = np.asarray([calibration.origin, calibration.corner_u, calibration.corner_v])
+    reference = Rotation.from_rotvec(calibration.rotvec)
+    np.testing.assert_allclose(targets + reference.apply(offset), tips, atol=1e-12)
+    np.testing.assert_allclose(reference.as_matrix(), rotations[-1].as_matrix(), atol=1e-12)
+    np.testing.assert_allclose(calibration.normal, paper.normal, atol=1e-12)
+    # Final teaching pose is already a valid start for drawing, despite wrist changes.
+    controller = DrawingController(calibration, contacts[-1])
+    controller.add_sample(TabletSample(0.4, 0.4, True))
+    commands, _ = drain(controller)
+    expected_tip = paper.map_sample(TabletSample(0.4, 0.4, True))
+    assert expected_tip is not None
+    np.testing.assert_allclose(commands[-1, :3] + reference.apply(offset), expected_tip, atol=1e-12)
+    calibration.save(tmp_path / "offset.json")
+    loaded = PaperCalibration.load(tmp_path / "offset.json")
+    assert loaded.tip_offset_m is not None
+    np.testing.assert_allclose(loaded.tip_offset_m, offset)
+
+
+def test_known_axial_tip_offset_allows_large_pen_axis_rotation(paper):
+    rotations = Rotation.from_euler("z", [[0], [60], [180]], degrees=True)
+    offset = np.array([0, 0, 0.1])
+    tips = np.asarray([paper.origin, paper.corner_u, paper.corner_v])
+    contacts = np.column_stack((tips - offset, rotations.as_rotvec()))
+    calibration = PaperCalibration.from_contact_poses(list(contacts), offset)
+    np.testing.assert_allclose(calibration.axes, paper.axes, atol=1e-12)
+
+
+def test_explicit_zero_tip_offset_allows_rotation_when_tcp_is_at_tip(paper):
+    contacts = np.column_stack(([paper.origin, paper.corner_u, paper.corner_v], [[0, 0, 0], [0.5, 0, 0], [0, 0.6, 0]]))
+    with pytest.raises(ValueError, match="Unknown tip offset"):
+        PaperCalibration.from_contact_poses(list(contacts))
+    calibration = PaperCalibration.from_contact_poses(list(contacts), np.zeros(3))
+    np.testing.assert_allclose(calibration.axes, paper.axes)
+
+
+@pytest.mark.parametrize("offset", [[0, 0], [0, float("nan"), 0], [0, 0, float("inf")]])
+def test_contact_calibration_rejects_invalid_tip_offset(paper, offset):
+    contacts = [np.r_[point, paper.rotvec] for point in (paper.origin, paper.corner_u, paper.corner_v)]
+    with pytest.raises(ValueError, match="finite three-element"):
+        PaperCalibration.from_contact_poses(contacts, np.asarray(offset))
 
 
 def test_tablet_crop_rejects_outside_and_maps_corners(paper):
@@ -385,6 +434,30 @@ def test_calibration_hand_guides_then_holds_and_converts_sdk_units(paper, tmp_pa
     ]
 
 
+def test_calibrate_with_tip_offset_accepts_rotated_contacts(paper, tmp_path, monkeypatch):
+    offset_mm = np.array([12, -7, 100])
+    rotations = Rotation.from_euler("xyz", [[0, 0, 0], [30, 40, 50], [40, -30, 80]], degrees=True)
+    tips_mm = np.asarray([paper.origin, paper.corner_u, paper.corner_v]) * 1000
+    poses = iter(np.column_stack((tips_mm - rotations.apply(np.tile(offset_mm, (3, 1))), rotations.as_rotvec())))
+    arm = SimpleNamespace(
+        connect=lambda: None,
+        disconnect=lambda: None,
+        get_err_warn_code=lambda: (0, [0, 0]),
+        get_is_moving=lambda: False,
+        motion_enable=lambda _: 0,
+        set_mode=lambda _: 0,
+        set_state=lambda _: 0,
+        get_position_aa=lambda **_: (0, next(poses).tolist()),
+    )
+    monkeypatch.setattr(xarm.wrapper, "XArmAPI", lambda *_, **__: arm)
+    monkeypatch.setattr("builtins.input", lambda _: "")
+    output = tmp_path / "paper.json"
+    calibrate(argparse.Namespace(robot_ip="fake", output=output, flip_normal=False, tip_offset_mm=offset_mm.tolist()))
+    taught = PaperCalibration.load(output)
+    targets_mm = np.asarray([taught.origin, taught.corner_u, taught.corner_v]) * 1000
+    np.testing.assert_allclose(targets_mm + Rotation.from_rotvec(taught.rotvec).apply(offset_mm), tips_mm, atol=1e-10)
+
+
 @pytest.mark.parametrize("failure", [KeyboardInterrupt, RuntimeError])
 def test_hand_guiding_is_disabled_on_aborted_calibration(tmp_path, monkeypatch, failure):
     calls = []
@@ -427,6 +500,26 @@ def test_hand_guiding_failure_does_not_continue_teaching(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match=r"hand guiding.*23"):
         calibrate(argparse.Namespace(robot_ip="fake", output=tmp_path / "paper.json", flip_normal=False))
     assert calls == [("mode", 2), ("state", 4), ("mode", 0), ("state", 0), "disconnect"]
+    assert not (tmp_path / "paper.json").exists()
+
+
+def test_controller_fault_during_teaching_prevents_recording_contact(tmp_path, monkeypatch):
+    errors = iter([(0, [0, 0]), (0, [37, 0])])
+    calls = []
+    arm = SimpleNamespace(
+        connect=lambda: None,
+        disconnect=lambda: calls.append("disconnect"),
+        get_err_warn_code=lambda: next(errors),
+        get_is_moving=lambda: False,
+        motion_enable=lambda _: 0,
+        set_mode=lambda mode: calls.append(("mode", mode)) or 0,
+        set_state=lambda state: calls.append(("state", state)) or 0,
+    )
+    monkeypatch.setattr(xarm.wrapper, "XArmAPI", lambda *_, **__: arm)
+    monkeypatch.setattr("builtins.input", lambda _: "")
+    with pytest.raises(RuntimeError, match=r"controller error/warning \[37, 0\]"):
+        calibrate(argparse.Namespace(robot_ip="fake", output=tmp_path / "paper.json", flip_normal=False))
+    assert calls[-4:] == [("state", 4), ("mode", 0), ("state", 0), "disconnect"]
     assert not (tmp_path / "paper.json").exists()
 
 

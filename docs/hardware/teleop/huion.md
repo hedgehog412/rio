@@ -83,8 +83,8 @@ mouse mode. The reader opens evdev directly and does not grab the desktop device
 
 ## 2. Teach the paper rectangle
 
-Keep the paper, pen mount, TCP configuration, and pen orientation fixed throughout
-calibration and recording. Choose a reachable rectangle entirely on the paper.
+Keep the paper, pen mount, and robot TCP configuration fixed throughout calibration
+and recording. Choose a reachable rectangle entirely on the paper.
 
 ```bash
 uv run -m examples.teleop_tablet calibrate --robot-ip 192.168.1.111 --output paper.json
@@ -95,17 +95,46 @@ the arm with the pen clear of the paper, then enables motors and **joint teachin
 mode 2** (`motion_enable(True)`, `set_mode(2)`, `set_state(0)`). This is gravity-compensated
 hand guiding, so you can move the follower directly by hand to each contact point:
 tablet top-left, top-right, then bottom-left. It sends no pose/joint trajectories and
-does not release the motors/brakes. Keep the pen's orientation the same at each point;
-teaching mode allows rotation as well as translation. Configure the pen's actual payload
-in Studio so gravity compensation is appropriate.
+does not release the motors/brakes. Teaching mode allows rotation as well as translation.
+Configure the pen's actual payload in Studio so gravity compensation is appropriate.
+
+### Teaching with a known TCP-to-tip offset
+
+When the pen tip is a known fixed offset from the reported TCP, supply that vector
+with `--tip-offset-mm X Y Z`. All three values are in **millimeters in the reported
+TCP's local coordinate frame**, not world coordinates. A scalar pen length is enough
+only when its direction along that frame's axes is also known. If Studio's TCP is
+already at the physical pen tip, explicitly pass `--tip-offset-mm 0 0 0`.
+
+For a measured offset, enter the three values interactively, then calibrate:
+
+```bash
+read -r -p 'Measured TCP-to-tip offset in mm (X Y Z): ' TIP_X_MM TIP_Y_MM TIP_Z_MM
+uv run -m examples.teleop_tablet calibrate \
+  --robot-ip 192.168.2.176 --output paper.json \
+  --tip-offset-mm "$TIP_X_MM" "$TIP_Y_MM" "$TIP_Z_MM"
+```
+
+In this mode the wrist may rotate freely between the three contact points. The code
+computes each tip position as `p_tip = p_tcp + R_tcp @ offset`, then converts the
+three contacts into drawing targets at the **last taught orientation**. Choose the
+desired drawing angle at the final corner; that angle stays fixed during drawing.
+The offset is saved in `paper.json` as `tip_offset_m` for provenance. The program does
+not change Studio's TCP configuration. Do not apply a flange-to-tip offset again if
+Studio has already applied it to the reported TCP.
+
+Without `--tip-offset-mm`, calibration retains the legacy assumption of a constant
+unknown offset and requires orientation to stay within three degrees of the first
+point. With an explicit offset, including zero for a tip TCP, that teaching restriction
+does not apply. Startup still checks the chosen drawing orientation; leave the arm
+at its final teaching pose or align to that same orientation before starting a run.
 
 On completion, Ctrl+C, or an error, calibration stops teaching and returns to mode 0
 to hold the current position before disconnecting. It never restores an earlier servo
 mode or sends the arm home. Controller errors/warnings and SDK failures are reported;
-they are not automatically cleared. The calibration rejects orientation
-changes exceeding three degrees and degenerate rectangles. It stores TCP positions in
-meters and orientation as a rotation vector in radians. A fixed pen offset is absorbed
-by teaching the contact poses; no flange-to-tip conversion is needed.
+they are not automatically cleared. A controller fault encountered while teaching
+also prevents recording the contact. Degenerate rectangles are rejected. Calibration
+stores drawing TCP targets in meters and orientation as a rotation vector in radians.
 
 The clearance normal defaults toward robot base +Z, appropriate for desktop paper.
 Inspect the printed normal; `--flip-normal` reverses it for a differently mounted

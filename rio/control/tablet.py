@@ -26,10 +26,11 @@ class TabletSample:
 
 @dataclass
 class PaperCalibration:
-    """Three TCP contact positions, all taught with the same pen orientation.
+    """TCP targets for a paper rectangle at a fixed drawing orientation.
 
-    The fixed pen offset is absorbed into these TCP positions. The robot's TCP
-    configuration and pen mounting must remain unchanged after calibration.
+    With a known tip offset, contact poses may have different orientations. Their
+    tip positions are converted into TCP targets for the chosen drawing orientation.
+    The robot's TCP configuration and pen mounting must stay unchanged afterward.
     """
 
     origin: list[float]
@@ -38,6 +39,7 @@ class PaperCalibration:
     rotvec: list[float]
     normal_sign: int = 1
     tablet_bounds: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
+    tip_offset_m: list[float] | None = None
 
     def __post_init__(self):
         points = np.asarray([self.origin, self.corner_u, self.corner_v, self.rotvec], dtype=float)
@@ -45,6 +47,10 @@ class PaperCalibration:
             raise ValueError("Calibration requires finite 3D points and a rotation vector.")
         if self.normal_sign not in (-1, 1):
             raise ValueError("normal_sign must be -1 or 1.")
+        if self.tip_offset_m is not None:
+            offset = np.asarray(self.tip_offset_m, dtype=float)
+            if offset.shape != (3,) or not np.isfinite(offset).all():
+                raise ValueError("tip_offset_m must be a finite three-element vector.")
         a, b = points[1] - points[0], points[2] - points[0]
         lengths = np.linalg.norm(a), np.linalg.norm(b)
         if min(lengths) < 0.005 or np.linalg.norm(np.cross(a, b)) / np.prod(lengths) < 0.1:
@@ -88,6 +94,31 @@ class PaperCalibration:
 
     def save(self, path: str | Path):
         Path(path).write_text(json.dumps(asdict(self), indent=2) + "\n")
+
+    @classmethod
+    def from_contact_poses(cls, poses: list[np.ndarray], tip_offset_m: np.ndarray | None = None) -> "PaperCalibration":
+        """Fit from tip contacts using an offset expressed in the reported TCP frame.
+
+        An explicit offset, including zero for a TCP already at the tip, permits
+        arbitrary teaching orientations. Drawing uses the last taught orientation,
+        so the arm can start directly from its final calibration pose. With an
+        unknown offset, retain the legacy constant-orientation assumption.
+        """
+        contacts = np.asarray(poses, dtype=float)
+        if contacts.shape != (3, 6) or not np.isfinite(contacts).all():
+            raise ValueError("Exactly three finite six-element contact poses are required.")
+        rotations = Rotation.from_rotvec(contacts[:, 3:])
+        if tip_offset_m is None:
+            if np.any((rotations[0].inv() * rotations).magnitude() > np.deg2rad(3)):
+                raise ValueError("Unknown tip offset: keep orientation within 3 degrees or supply --tip-offset-mm X Y Z.")
+            return cls(*contacts[:, :3].tolist(), rotvec=contacts[0, 3:].tolist())
+        offset = np.asarray(tip_offset_m, dtype=float)
+        if offset.shape != (3,) or not np.isfinite(offset).all():
+            raise ValueError("tip_offset_m must be a finite three-element vector.")
+        tips = contacts[:, :3] + rotations.apply(np.tile(offset, (3, 1)))
+        # p_tip = p_tcp + R_tcp @ offset. Express all contacts at the final R_tcp.
+        targets = tips - rotations[-1].apply(offset)
+        return cls(*targets.tolist(), rotvec=contacts[-1, 3:].tolist(), tip_offset_m=offset.tolist())
 
     @classmethod
     def load(cls, path: str | Path) -> "PaperCalibration":

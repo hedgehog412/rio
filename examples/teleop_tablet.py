@@ -102,6 +102,10 @@ def _sdk_ok(code, operation: str):
 def calibrate(args):
     from xarm.wrapper import XArmAPI
 
+    offset_mm = getattr(args, "tip_offset_mm", None)
+    tip_offset = None if offset_mm is None else np.asarray(offset_mm, dtype=float) * 0.001
+    if tip_offset is not None and (tip_offset.shape != (3,) or not np.isfinite(tip_offset).all()):
+        raise ValueError("--tip-offset-mm requires three finite numbers in the reported TCP frame.")
     arm = XArmAPI(args.robot_ip, is_radian=True, do_not_open=True)
     poses = []
     guiding_changed = False
@@ -122,11 +126,23 @@ def calibrate(args):
         print(
             "Hand guiding is enabled (mode 2). Move the arm by hand to teach three TCP contact poses.\n"
             "Motors remain enabled for gravity compensation; no pose trajectories are sent.\n"
-            "Keep the pen orientation and TCP configuration identical at all three points.\n"
             "The corners define the actual drawing rectangle, not necessarily the full sheet."
         )
+        if tip_offset is None:
+            print("No tip offset supplied: keep orientation within 3 degrees of the first point.")
+        else:
+            print(
+                f"TCP-to-tip offset: {offset_mm} mm in the reported TCP frame. Wrist orientation may change.\n"
+                "Choose the desired drawing orientation at the LAST corner; drawing will keep that orientation."
+            )
         for label in ("origin (tablet top-left)", "+U corner (tablet top-right)", "+V corner (tablet bottom-left)"):
             input(f"Place pen in light contact at {label}, then press Enter: ")
+            code, errors = arm.get_err_warn_code()
+            _sdk_ok(code, "Checking controller before recording contact")
+            if any(errors):
+                raise RuntimeError(
+                    f"Calibration stopped: controller error/warning {errors}. Resolve it in Studio before retrying."
+                )
             code, values = arm.get_position_aa(is_radian=True)
             if code != 0:
                 raise RuntimeError(f"Reading robot TCP pose failed: {code}")
@@ -134,10 +150,10 @@ def calibrate(args):
             pose[:3] *= 0.001  # SDK millimeters -> RIO meters; rotation is already axis-angle/radians.
             if pose.shape != (6,) or not np.isfinite(pose).all():
                 raise ValueError("Robot returned an invalid TCP pose.")
-            if poses:
+            if poses and tip_offset is None:
                 angle = (Rotation.from_rotvec(poses[0][3:]).inv() * Rotation.from_rotvec(pose[3:])).magnitude()
                 if angle > np.deg2rad(3):
-                    raise ValueError("Pen orientation changed by more than 3 degrees. Repeat calibration.")
+                    raise ValueError("Unknown tip offset: keep orientation within 3 degrees or supply --tip-offset-mm X Y Z.")
             poses.append(pose)
             print(f"TCP: {pose.tolist()}")
     finally:
@@ -155,7 +171,7 @@ def calibrate(args):
             arm.disconnect()
     if hold_error is not None:
         raise RuntimeError(f"Calibration not saved because restoring position hold failed: {hold_error}")
-    calibration = PaperCalibration(poses[0][:3].tolist(), poses[1][:3].tolist(), poses[2][:3].tolist(), poses[0][3:].tolist())
+    calibration = PaperCalibration.from_contact_poses(poses, tip_offset)
     # For a desktop drawing surface, clearance points toward base +Z.
     calibration.normal_sign = 1 if calibration.normal[2] >= 0 else -1
     if args.flip_normal:
@@ -392,6 +408,13 @@ def main():
     teaching = subparsers.add_parser("calibrate", help="Hand-guide the arm to three contact poses; no pose trajectories.")
     teaching.add_argument("--robot-ip", required=True)
     teaching.add_argument("--output", default="paper.json")
+    teaching.add_argument(
+        "--tip-offset-mm",
+        nargs=3,
+        type=float,
+        metavar=("X", "Y", "Z"),
+        help="Vector from the robot's reported TCP to the pen tip, expressed in that TCP frame. Allows wrist rotation.",
+    )
     teaching.add_argument("--flip-normal", action="store_true", help="Reverse the default normal pointing toward base +Z.")
     for command in ("preview", "run"):
         child = subparsers.add_parser(command)
