@@ -5,9 +5,9 @@ pen in a calibrated paper plane. It runs through RIO's `XarmArm`/`task_pos` driv
 recorder. It does not require a leader arm, desktop mouse mapping, or an additional
 Python dependency. Stylus pressure is recorded but does not command downward motion.
 
-**Experimental: not tested on physical Huion or Lite 6 hardware.** Automated tests
-use synthetic input and simulated robot feedback; physical drawing and hand guiding
-remain unverified.
+**Experimental: Lite 6 motion and paper contact remain unverified on physical hardware.**
+The user has verified stylus coordinates, contact, and both side buttons with DIGImend
+13 on Ubuntu 20.04/kernel 5.15. Automated motion tests use simulated robot feedback.
 
 ## 1. Find the stylus input node
 
@@ -128,7 +128,39 @@ writes `tablet_preview.svg`. Open it to check orientation, crop, and stroke sepa
 controller without a tablet, add `--demo`; this draws a square and a separate diagonal.
 Neither preview mode imports or starts the robot driver.
 
-## 4. Run and record
+## 4. First motion test above the paper
+
+Keep the pen mount and paper fixed after teaching the three contact points. For a
+first trial, an 80 x 50 mm drawing rectangle is a convenient small area with roughly
+the Inspiroy 2 M's aspect ratio. Stop other robot-control scripts and leave the arm
+over that rectangle with the taught pen orientation.
+
+Use an air gap for the first motion test, without recording:
+
+```bash
+uv run -m examples.teleop_tablet run \
+  --robot-ip 192.168.2.176 \
+  --calibration paper.json \
+  --device /dev/input/event29 \
+  --air-gap-mm 10 \
+  --speed-mm-s 5 \
+  --lift-speed-mm-s 2 \
+  --no-record
+```
+
+This example uses the follower IP in `Lite6LeaderFollowerStation` and the user's
+verified pen node; adjust the IP if your robot configuration differs. The calibrated
+paper plane stays unchanged. Stylus contact now traces 10 mm above it; pen-up travel
+is another 5 mm higher. The arm first raises along the paper normal before any lateral
+movement, including when starting at a taught contact point. Move the stylus slowly
+and test two separate strokes, checking their direction and the lift between them.
+Ctrl+C discards queued strokes and attempts a vertical retract to the travel height.
+
+An air gap raises position targets; it does not add force sensing. To make contact
+after a successful air test, rerun with `--air-gap-mm 0` (the default). Positive gaps
+are also included as `meta/drawing_air_gap_m` in recordings.
+
+## 5. Run and record
 
 Position the arm above the calibrated rectangle with its taught orientation. Start:
 

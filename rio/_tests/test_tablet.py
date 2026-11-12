@@ -247,6 +247,30 @@ def test_abort_discards_strokes_and_retracts_without_lateral_motion(paper):
     assert local[-1, 2] == pytest.approx(0.005)
 
 
+def test_air_test_lifts_from_paper_and_preserves_gap_on_tilted_plane(paper):
+    controller = DrawingController(paper, np.r_[paper.origin, paper.rotvec], draw_height=0.01)
+    controller.add_sample(TabletSample(0.2, 0.2, True))
+    controller.add_sample(TabletSample(0.8, 0.8, True))
+    commands, phases = drain(controller)
+    local = np.array([paper.coordinates(pose[:3]) for pose in commands])
+    lift = np.array([phase == "lift" for phase in phases])
+    draw = np.array([phase == "draw" for phase in phases])
+    travel = np.array([phase == "travel" for phase in phases])
+    np.testing.assert_allclose(local[lift, :2], 0, atol=1e-12)
+    np.testing.assert_allclose(local[travel, 2], 0.015, atol=1e-12)
+    np.testing.assert_allclose(local[draw, 2], 0.01, atol=1e-12)
+    assert np.all(local[~lift, 2] >= 0.01 - 1e-12)
+    controller.retract(commands[-1])
+    retraction, _ = drain(controller)
+    np.testing.assert_allclose(paper.coordinates(retraction[-1, :3]), [0.8, 0.8, 0.015], atol=1e-12)
+
+
+@pytest.mark.parametrize("gap", [-0.001, float("nan"), float("inf")])
+def test_air_test_rejects_invalid_or_negative_gap(paper, gap):
+    with pytest.raises(ValueError, match="draw_height"):
+        DrawingController(paper, start_pose(paper), draw_height=gap)
+
+
 class FakeEnv:
     def __init__(self, pose):
         self.pose = pose.copy()
@@ -462,7 +486,8 @@ def test_input_check_reports_quick_button_edges_and_requires_both(monkeypatch, c
 
 
 @pytest.mark.parametrize("failure", [KeyboardInterrupt, ConnectionError])
-def test_run_retracts_and_saves_after_interrupt_or_disconnect(paper, tmp_path, monkeypatch, failure):
+@pytest.mark.parametrize("air_gap_mm", [0, 10])
+def test_run_retracts_and_saves_after_interrupt_or_disconnect(paper, tmp_path, monkeypatch, failure, air_gap_mm):
     paper.save(tmp_path / "paper.json")
     clock = SimpleNamespace(value=100.0)
     monkeypatch.setattr(rio_hw.time, "now", lambda: clock.value)
@@ -507,6 +532,7 @@ def test_run_retracts_and_saves_after_interrupt_or_disconnect(paper, tmp_path, m
         speed_mm_s=20,
         lift_speed_mm_s=5,
         max_queue=10000,
+        air_gap_mm=air_gap_mm,
     )
     if failure is ConnectionError:
         with pytest.raises(ConnectionError):
@@ -515,7 +541,8 @@ def test_run_retracts_and_saves_after_interrupt_or_disconnect(paper, tmp_path, m
         run(args)
     assert saved == [True]
     assert any(record.meta["drawing_phase"] == "lower" for record in env.records)
-    np.testing.assert_allclose(paper.coordinates(env.pose[:3]), [0.2, 0.2, 0.005], atol=1e-9)
+    np.testing.assert_allclose(paper.coordinates(env.pose[:3]), [0.2, 0.2, 0.005 + air_gap_mm * 0.001], atol=1e-9)
+    assert env.records[-1].meta["drawing_air_gap_m"] == air_gap_mm * 0.001
     assert env.records[-1].meta["drawing_phase"] == "lift"
     traces = list((tmp_path / "recordings").glob("*_input.jsonl"))
     assert len(traces) == 1

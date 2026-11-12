@@ -220,6 +220,7 @@ def make_controller(args, calibration: PaperCalibration, pose: np.ndarray) -> Dr
         speed=args.speed_mm_s * 0.001,
         lift_speed=args.lift_speed_mm_s * 0.001,
         max_queue=args.max_queue,
+        draw_height=getattr(args, "air_gap_mm", 0.0) * 0.001,
     )
 
 
@@ -276,6 +277,7 @@ def drawing_step(env, controller, dt, target_time, sample):
         "drawing_phase": controller.phase,
         "drawing_queue": len(controller.queue),
         "drawing_target_time": target_time,
+        "drawing_air_gap_m": controller.draw_height,
     }
     if env.recorder:
         env.recorder.record_step(step)
@@ -325,6 +327,8 @@ def run(args):
         with ServerManager(station.mw, [server for server in servers.values() if server is not None]), env:
             measured = read_pose(env)
             controller = make_controller(args, calibration, measured)
+            if args.air_gap_mm:
+                print(f"Air test: drawing targets are {args.air_gap_mm:g} mm above the taught paper plane.")
             input("Lift the stylus off the tablet. Press Enter to begin drawing (Ctrl+C retracts and saves): ")
             tablet.poll()  # Discard all pre-session input; never replay old contact events.
             if tablet.events.touching:
@@ -359,7 +363,7 @@ def run(args):
                 try:
                     measured = read_pose(env)
                     controller.retract(measured)
-                    deadline = time.now() + args.clearance_mm / args.lift_speed_mm_s + 3
+                    deadline = time.now() + (args.air_gap_mm + args.clearance_mm) / args.lift_speed_mm_s + 3
                     while controller.queue and time.now() < deadline:
                         tick_start = time.now()
                         drawing_step(env, controller, dt, time.now() + 2 * dt + station.arm_latency, sample)
@@ -406,6 +410,12 @@ def main():
             child.add_argument("--station", help="Registered Lite6 drawing station with your cameras/recorder settings.")
             child.add_argument("--record-path", help="Override the recorder directory (default: data/drawing/).")
             child.add_argument("--no-record", action="store_true")
+            child.add_argument(
+                "--air-gap-mm",
+                type=float,
+                default=0.0,
+                help="Raise drawing targets above the calibrated paper plane for an air test; zero makes contact.",
+            )
     args = parser.parse_args()
     if hasattr(args, "freq") and not 1 <= args.freq <= 250:
         parser.error("--freq must be between 1 and 250 Hz.")

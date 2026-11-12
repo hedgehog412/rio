@@ -117,15 +117,21 @@ class DrawingController:
         lift_speed: float = 0.005,
         arrival_tolerance: float = 0.0005,
         max_queue: int = 10000,
+        draw_height: float = 0.0,
     ):
         if not all(np.isfinite(x) and x > 0 for x in (clearance, speed, lift_speed, arrival_tolerance)):
             raise ValueError("Clearance, speeds, and arrival tolerance must be finite and positive.")
         if max_queue < 4:
             raise ValueError("max_queue must be at least four.")
-        calibration.validate_start(np.asarray(start_pose), clearance)
+        if not np.isfinite(draw_height) or draw_height < 0:
+            raise ValueError("draw_height must be finite and nonnegative.")
+        hover_height = draw_height + clearance
+        calibration.validate_start(np.asarray(start_pose), hover_height)
         self.calibration = calibration
         self.position = np.array(start_pose[:3], dtype=float)
         self.clearance = clearance
+        self.draw_height = draw_height
+        self.hover_height = hover_height
         self.speed = speed
         self.lift_speed = lift_speed
         self.arrival_tolerance = arrival_tolerance
@@ -134,7 +140,7 @@ class DrawingController:
         self.touching = False
         self.phase = "lift"
         self.planned_surface = self.position - calibration.coordinates(self.position)[2] * calibration.normal
-        self._append(self.planned_surface + clearance * calibration.normal, "lift", True)
+        self._append(self.planned_surface + hover_height * calibration.normal, "lift", True)
 
     def _append(self, position: np.ndarray, phase: str, gate: bool = False):
         if len(self.queue) >= self.max_queue:
@@ -149,31 +155,31 @@ class DrawingController:
         normal = self.calibration.normal
         if self.touching and not touching:
             # Lift at the LAST CONTACT location, not the new hover location.
-            self._append(self.planned_surface + self.clearance * normal, "lift", True)
+            self._append(self.planned_surface + self.hover_height * normal, "lift", True)
         if surface is not None:
             if touching:
                 if not self.touching:
-                    self._append(surface + self.clearance * normal, "travel", True)
-                    self._append(surface, "lower", True)
+                    self._append(surface + self.hover_height * normal, "travel", True)
+                    self._append(surface + self.draw_height * normal, "lower", True)
                 else:
-                    self._append(surface, "draw")
+                    self._append(surface + self.draw_height * normal, "draw")
             else:
                 # Hover positions are replaceable; contact/lift waypoints are not.
                 if self.queue and self.queue[-1].phase == "travel":
                     self.queue.pop()
-                self._append(surface + self.clearance * normal, "travel", True)
+                self._append(surface + self.hover_height * normal, "travel", True)
             self.planned_surface = surface
         self.touching = touching
 
     def retract(self, measured_pose: np.ndarray | None = None):
         """Discard unfinished strokes and retract vertically from measured position."""
         if measured_pose is not None:
-            self.calibration.validate_start(measured_pose, self.clearance)
+            self.calibration.validate_start(measured_pose, self.hover_height)
             self.position = np.array(measured_pose[:3], dtype=float)
         self.queue.clear()
         self.touching = False
         height = self.calibration.coordinates(self.position)[2]
-        target = self.position + max(0.0, self.clearance - height) * self.calibration.normal
+        target = self.position + max(0.0, self.hover_height - height) * self.calibration.normal
         self._append(target, "lift", True)
 
     def step(self, dt: float, measured_position: np.ndarray | None = None) -> np.ndarray:
