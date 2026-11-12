@@ -11,15 +11,11 @@ class Lite6TabletStation:
     # EDIT HERE: measured TCP-to-pen-tip (X, Y, Z), in mm in the reported TCP frame.
     # None = unknown offset (legacy fixed-orientation teaching).
     # Use (0.0, 0.0, 0.0) only if Studio already reports the physical pen-tip TCP.
-<<<<<<< HEAD
-    tip_offset_mm: tuple[0.0, 0.0, 184.0] | None = None
-=======
-    tip_offset_mm: tuple[float, float, float] | None = None
+    tip_offset_mm: tuple[0.0, 0.0, 184.] | None = None
     # Re-touch each marked corner with a different wrist tilt to check the offset.
     calibration_repeats: int = 2
     # Maximum pairwise distance between computed tips at the SAME physical corner.
     calibration_max_discrepancy_mm: float = 2.0
->>>>>>> b8d92bb196114742510dc9f7c0fd7d0205ff9bb8
 
     arm: str = "XarmArm"
     arm_cfg: NodeCfg = field(
