@@ -11,7 +11,7 @@ class Lite6TabletStation:
     # EDIT HERE: measured TCP-to-pen-tip (X, Y, Z), in mm in the reported TCP frame.
     # None = unknown offset (legacy fixed-orientation teaching).
     # Use (0.0, 0.0, 0.0) only if Studio already reports the physical pen-tip TCP.
-    tip_offset_mm: tuple[float, float, float] | None = None
+    tip_offset_mm: tuple[0.0, 0.0, 184.0] | None = None
 
     arm: str = "XarmArm"
     arm_cfg: NodeCfg = field(
