@@ -123,6 +123,62 @@ def test_contact_calibration_rejects_invalid_tip_offset(paper, offset):
         PaperCalibration.from_contact_poses(contacts, np.asarray(offset))
 
 
+@pytest.fixture
+def repeated_contacts(paper):
+    offset = np.array([0.012, -0.007, 0.1])
+    rotations = Rotation.from_euler("xyz", [[0, 0, 0], [20, -25, 30]], degrees=True)
+    groups = [
+        list(np.column_stack((np.asarray(tip) - rotations.apply(np.tile(offset, (2, 1))), rotations.as_rotvec())))
+        for tip in (paper.origin, paper.corner_u, paper.corner_v)
+    ]
+    return offset, groups
+
+
+def test_repeated_contacts_keep_paper_height_and_tilt_and_save_per_corner_errors(paper, repeated_contacts, tmp_path):
+    offset, groups = repeated_contacts
+    calibration = PaperCalibration.from_repeated_contacts(groups, offset)
+    checks = calibration.contact_checks
+    assert checks is not None and len(checks) == 3
+    assert all(check["max_discrepancy_mm"] < 1e-9 and check["z_spread_mm"] < 1e-9 for check in checks)
+    tips = np.asarray([calibration.origin, calibration.corner_u, calibration.corner_v])
+    tips += Rotation.from_rotvec(calibration.rotvec).apply(offset)
+    np.testing.assert_allclose(tips, [paper.origin, paper.corner_u, paper.corner_v], atol=1e-12)
+    np.testing.assert_allclose(calibration.normal, paper.normal, atol=1e-12)
+    calibration.validate_start(groups[-1][-1], 0.005)
+    calibration.save(tmp_path / "checked.json")
+    assert PaperCalibration.load(tmp_path / "checked.json").contact_checks == checks
+
+
+def test_repeated_contacts_reject_wrong_tip_length(repeated_contacts):
+    offset, groups = repeated_contacts
+    wrong = offset + np.array([0, 0, 0.02])
+    with pytest.raises(ValueError, match="Contact discrepancy exceeds"):
+        PaperCalibration.from_repeated_contacts(groups, wrong)
+
+
+def test_repeated_contacts_reject_one_inconsistent_corner_and_report_all(paper, repeated_contacts):
+    offset, groups = repeated_contacts
+    groups[1][1][:3] += 0.005 * paper.normal
+    with pytest.raises(ValueError, match=r"origin:.*\+U: XYZ=5.000 mm, Z=4.000 mm.*\+V:"):
+        PaperCalibration.from_repeated_contacts(groups, offset)
+
+
+def test_repeated_contacts_cannot_identify_common_offset_error_without_rotation(paper):
+    offset = np.array([0, 0, 0.1])
+    groups = [[np.r_[np.asarray(tip) - offset, [0, 0, 0]]] * 2 for tip in (paper.origin, paper.corner_u, paper.corner_v)]
+    calibration = PaperCalibration.from_repeated_contacts(groups, offset + np.array([0, 0, 0.02]))
+    # Common bias is indistinguishable from a different paper height in this capture.
+    assert calibration.contact_checks is not None
+    assert all(check["max_discrepancy_mm"] == 0 for check in calibration.contact_checks)
+
+
+@pytest.mark.parametrize("tolerance", [0, -0.001, float("nan")])
+def test_repeated_contacts_require_positive_finite_tolerance(repeated_contacts, tolerance):
+    offset, groups = repeated_contacts
+    with pytest.raises(ValueError, match="finite and positive"):
+        PaperCalibration.from_repeated_contacts(groups, offset, tolerance)
+
+
 def test_tablet_crop_rejects_outside_and_maps_corners(paper):
     paper.tablet_bounds = (0.1, 0.2, 0.9, 0.8)
     assert paper.map_sample(TabletSample(0.05, 0.5, True)) is None
@@ -439,7 +495,9 @@ def test_calibrate_with_tip_offset_accepts_rotated_contacts(paper, tmp_path, mon
     offset_mm = np.array([12, -7, 100])
     rotations = Rotation.from_euler("xyz", [[0, 0, 0], [30, 40, 50], [40, -30, 80]], degrees=True)
     tips_mm = np.asarray([paper.origin, paper.corner_u, paper.corner_v]) * 1000
-    poses = iter(np.column_stack((tips_mm - rotations.apply(np.tile(offset_mm, (3, 1))), rotations.as_rotvec())))
+    poses = iter(
+        np.repeat(np.column_stack((tips_mm - rotations.apply(np.tile(offset_mm, (3, 1))), rotations.as_rotvec())), 2, axis=0)
+    )
     arm = SimpleNamespace(
         connect=lambda: None,
         disconnect=lambda: None,
@@ -468,6 +526,32 @@ def test_calibrate_with_tip_offset_accepts_rotated_contacts(paper, tmp_path, mon
     taught = PaperCalibration.load(output)
     targets_mm = np.asarray([taught.origin, taught.corner_u, taught.corner_v]) * 1000
     np.testing.assert_allclose(targets_mm + Rotation.from_rotvec(taught.rotvec).apply(offset_mm), tips_mm, atol=1e-10)
+    assert taught.contact_checks is not None and len(taught.contact_checks) == 3
+
+
+def test_failed_repeat_check_preserves_existing_calibration(repeated_contacts, tmp_path, monkeypatch):
+    offset, groups = repeated_contacts
+    groups[1][1][:3] += [0, 0, 0.01]
+    sdk_poses = np.concatenate(groups).copy()
+    sdk_poses[:, :3] *= 1000
+    poses = iter(sdk_poses)
+    arm = SimpleNamespace(
+        connect=lambda: None,
+        disconnect=lambda: None,
+        get_err_warn_code=lambda: (0, [0, 0]),
+        get_is_moving=lambda: False,
+        motion_enable=lambda _: 0,
+        set_mode=lambda _: 0,
+        set_state=lambda _: 0,
+        get_position_aa=lambda **_: (0, next(poses).tolist()),
+    )
+    monkeypatch.setattr(xarm.wrapper, "XArmAPI", lambda *_, **__: arm)
+    monkeypatch.setattr("builtins.input", lambda _: "")
+    output = tmp_path / "paper.json"
+    output.write_text("previous calibration")
+    with pytest.raises(ValueError, match="Contact discrepancy exceeds"):
+        calibrate(argparse.Namespace(robot_ip="fake", output=output, flip_normal=False, tip_offset_mm=(offset * 1000).tolist()))
+    assert output.read_text() == "previous calibration"
 
 
 @pytest.mark.parametrize("failure", [KeyboardInterrupt, RuntimeError])

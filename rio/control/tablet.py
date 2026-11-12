@@ -40,6 +40,7 @@ class PaperCalibration:
     normal_sign: int = 1
     tablet_bounds: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
     tip_offset_m: list[float] | None = None
+    contact_checks: list[dict] | None = None
 
     def __post_init__(self):
         points = np.asarray([self.origin, self.corner_u, self.corner_v, self.rotvec], dtype=float)
@@ -119,6 +120,56 @@ class PaperCalibration:
         # p_tip = p_tcp + R_tcp @ offset. Express all contacts at the final R_tcp.
         targets = tips - rotations[-1].apply(offset)
         return cls(*targets.tolist(), rotvec=contacts[-1, 3:].tolist(), tip_offset_m=offset.tolist())
+
+    @classmethod
+    def from_repeated_contacts(
+        cls, groups: list[list[np.ndarray]], tip_offset_m: np.ndarray, max_discrepancy_m: float = 0.002
+    ) -> "PaperCalibration":
+        """Check repeated contacts at each corner before fitting the paper plane.
+
+        Each group must touch the SAME marked point; wrist angles may differ.
+        This measures tip-position consistency, not absolute offset accuracy.
+        The final contact at each corner defines the plane, preserving a valid
+        start at the last recorded pose. No tool offset is adjusted automatically.
+        """
+        if len(groups) != 3:
+            raise ValueError("Repeated calibration requires three corner groups.")
+        offset = np.asarray(tip_offset_m, dtype=float)
+        if offset.shape != (3,) or not np.isfinite(offset).all():
+            raise ValueError("tip_offset_m must be a finite three-element vector.")
+        if not np.isfinite(max_discrepancy_m) or max_discrepancy_m <= 0:
+            raise ValueError("Maximum contact discrepancy must be finite and positive.")
+        checks: list[dict] = []
+        last_poses = []
+        for label, group in zip(("origin", "+U", "+V"), groups, strict=True):
+            poses = np.asarray(group, dtype=float)
+            if poses.ndim != 2 or poses.shape[0] < 2 or poses.shape[1] != 6 or not np.isfinite(poses).all():
+                raise ValueError("Each corner requires at least two finite six-element contact poses.")
+            tips = poses[:, :3] + Rotation.from_rotvec(poses[:, 3:]).apply(np.tile(offset, (len(poses), 1)))
+            spread = float(np.linalg.norm(tips[:, None, :] - tips[None, :, :], axis=2).max())
+            checks.append(
+                {
+                    "corner": label,
+                    "samples": len(poses),
+                    "max_discrepancy_mm": spread * 1000,
+                    "z_spread_mm": float(np.ptp(tips[:, 2])) * 1000,
+                    "contact_poses_m_rad": poses.tolist(),
+                    "tip_positions_m": tips.tolist(),
+                }
+            )
+            last_poses.append(poses[-1])
+        failed = [check for check in checks if check["max_discrepancy_mm"] > max_discrepancy_m * 1000 + 1e-9]
+        if failed:
+            details = "; ".join(
+                f"{c['corner']}: XYZ={c['max_discrepancy_mm']:.3f} mm, Z={c['z_spread_mm']:.3f} mm" for c in checks
+            )
+            raise ValueError(
+                f"Contact discrepancy exceeds {max_discrepancy_m * 1000:g} mm. {details}. "
+                "Check the measured tip offset, pen mounting, and repeated contact locations; calibration was not saved."
+            )
+        calibration = cls.from_contact_poses(last_poses, offset)
+        calibration.contact_checks = checks
+        return calibration
 
     @classmethod
     def load(cls, path: str | Path) -> "PaperCalibration":
