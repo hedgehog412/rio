@@ -100,19 +100,19 @@ Configure the pen's actual payload in Studio so gravity compensation is appropri
 
 ### Teaching with a known TCP-to-tip offset
 
-When the pen tip is a known fixed offset from the reported TCP, supply that vector
-with `--tip-offset-mm X Y Z`. All three values are in **millimeters in the reported
+Edit `tip_offset_mm` near the top of `examples/cfg/lite6_tablet.py` to set the measured
+TCP-to-pen-tip vector `(X, Y, Z)`. Calibration reads this file automatically; no offset
+command-line arguments or interactive offset entry are needed. The default `None`
+means the offset is unknown. All three values are in **millimeters in the reported
 TCP's local coordinate frame**, not world coordinates. A scalar pen length is enough
 only when its direction along that frame's axes is also known. If Studio's TCP is
-already at the physical pen tip, explicitly pass `--tip-offset-mm 0 0 0`.
+already at the physical pen tip, set `tip_offset_mm = (0.0, 0.0, 0.0)`.
 
-For a measured offset, enter the three values interactively, then calibrate:
+After editing the file, calibrate:
 
 ```bash
-read -r -p 'Measured TCP-to-tip offset in mm (X Y Z): ' TIP_X_MM TIP_Y_MM TIP_Z_MM
 uv run -m examples.teleop_tablet calibrate \
-  --robot-ip 192.168.2.176 --output paper.json \
-  --tip-offset-mm "$TIP_X_MM" "$TIP_Y_MM" "$TIP_Z_MM"
+  --robot-ip 192.168.2.176 --output paper.json
 ```
 
 In this mode the wrist may rotate freely between the three contact points. The code
@@ -123,7 +123,8 @@ The offset is saved in `paper.json` as `tip_offset_m` for provenance. The progra
 not change Studio's TCP configuration. Do not apply a flange-to-tip offset again if
 Studio has already applied it to the reported TCP.
 
-Without `--tip-offset-mm`, calibration retains the legacy assumption of a constant
+An optional `--tip-offset-mm X Y Z` overrides the file for one invocation. If both the
+file setting and the override are absent, calibration retains the legacy assumption of a constant
 unknown offset and requires orientation to stay within three degrees of the first
 point. With an explicit offset, including zero for a tip TCP, that teaching restriction
 does not apply. Startup still checks the chosen drawing orientation; leave the arm

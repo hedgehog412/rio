@@ -434,7 +434,8 @@ def test_calibration_hand_guides_then_holds_and_converts_sdk_units(paper, tmp_pa
     ]
 
 
-def test_calibrate_with_tip_offset_accepts_rotated_contacts(paper, tmp_path, monkeypatch):
+@pytest.mark.parametrize("offset_source", ["cli", "file"])
+def test_calibrate_with_tip_offset_accepts_rotated_contacts(paper, tmp_path, monkeypatch, offset_source):
     offset_mm = np.array([12, -7, 100])
     rotations = Rotation.from_euler("xyz", [[0, 0, 0], [30, 40, 50], [40, -30, 80]], degrees=True)
     tips_mm = np.asarray([paper.origin, paper.corner_u, paper.corner_v]) * 1000
@@ -451,8 +452,19 @@ def test_calibrate_with_tip_offset_accepts_rotated_contacts(paper, tmp_path, mon
     )
     monkeypatch.setattr(xarm.wrapper, "XArmAPI", lambda *_, **__: arm)
     monkeypatch.setattr("builtins.input", lambda _: "")
+    monkeypatch.setattr(
+        "examples.cfg.lite6_tablet.Lite6TabletStation",
+        lambda: SimpleNamespace(tip_offset_mm=offset_mm.tolist() if offset_source == "file" else [0, 0, 0]),
+    )
     output = tmp_path / "paper.json"
-    calibrate(argparse.Namespace(robot_ip="fake", output=output, flip_normal=False, tip_offset_mm=offset_mm.tolist()))
+    calibrate(
+        argparse.Namespace(
+            robot_ip="fake",
+            output=output,
+            flip_normal=False,
+            tip_offset_mm=offset_mm.tolist() if offset_source == "cli" else None,
+        )
+    )
     taught = PaperCalibration.load(output)
     targets_mm = np.asarray([taught.origin, taught.corner_u, taught.corner_v]) * 1000
     np.testing.assert_allclose(targets_mm + Rotation.from_rotvec(taught.rotvec).apply(offset_mm), tips_mm, atol=1e-10)

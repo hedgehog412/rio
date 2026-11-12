@@ -102,10 +102,14 @@ def _sdk_ok(code, operation: str):
 def calibrate(args):
     from xarm.wrapper import XArmAPI
 
+    from examples.cfg.lite6_tablet import Lite6TabletStation
+
     offset_mm = getattr(args, "tip_offset_mm", None)
+    if offset_mm is None:
+        offset_mm = Lite6TabletStation().tip_offset_mm
     tip_offset = None if offset_mm is None else np.asarray(offset_mm, dtype=float) * 0.001
     if tip_offset is not None and (tip_offset.shape != (3,) or not np.isfinite(tip_offset).all()):
-        raise ValueError("--tip-offset-mm requires three finite numbers in the reported TCP frame.")
+        raise ValueError("tip_offset_mm requires three finite numbers in the reported TCP frame.")
     arm = XArmAPI(args.robot_ip, is_radian=True, do_not_open=True)
     poses = []
     guiding_changed = False
@@ -413,7 +417,7 @@ def main():
         nargs=3,
         type=float,
         metavar=("X", "Y", "Z"),
-        help="Vector from the robot's reported TCP to the pen tip, expressed in that TCP frame. Allows wrist rotation.",
+        help="Override tip_offset_mm in examples/cfg/lite6_tablet.py (mm in the reported TCP frame).",
     )
     teaching.add_argument("--flip-normal", action="store_true", help="Reverse the default normal pointing toward base +Z.")
     for command in ("preview", "run"):
