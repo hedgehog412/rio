@@ -123,6 +123,38 @@ The offset is saved in `paper.json` as `tip_offset_m` for provenance. The progra
 not change Studio's TCP configuration. Do not apply a flange-to-tip offset again if
 Studio has already applied it to the reported TCP.
 
+### Paper height and per-corner consistency
+
+The measured offset does not replace touching the paper. The three marked corners
+still establish its actual height, tilt, position, and drawing area. Raw TCP Z is not
+directly comparable to a local TCP-to-tip Z offset; the offset must first be rotated
+into the robot base frame. Corners on a tilted sheet may legitimately have different Z.
+
+With a known offset, calibration defaults to **two contacts at each marked corner**.
+Between contacts, change the wrist tilt and return the tip to the exact same mark.
+Edit these settings in `examples/cfg/lite6_tablet.py`:
+
+```python
+calibration_repeats: int = 2
+calibration_max_discrepancy_mm: float = 2.0
+```
+
+For each corner, calibration reports the maximum pairwise XYZ distance and the Z
+spread between its computed tip positions. If any corner exceeds the configured
+XYZ tolerance, it reports all three corners and refuses to overwrite `paper.json`.
+Check the contact locations, rigid mounting, and measured offset; edit `tip_offset_mm`
+and rerun when the offset is wrong. The program does not automatically alter that
+physical measurement. Raw contact poses, tip positions, and discrepancy statistics
+are saved in `contact_checks` when validation succeeds.
+
+Three distinct points always define a plane, so their plane-fit residual alone cannot
+validate the tip offset. Repeated contacts test consistency, not absolute accuracy:
+the same wrist angle at every repeat can hide a common offset error. Pure spin about
+the pen axis also cannot expose an axial length error; use different tilts. The final
+accepted contact at each corner defines the plane, and the final sample's orientation
+is used for drawing. Setting `calibration_repeats = 1` disables the repeated-contact
+check; it is also unavailable in the legacy unknown-offset mode.
+
 An optional `--tip-offset-mm X Y Z` overrides the file for one invocation. If both the
 file setting and the override are absent, calibration retains the legacy assumption of a constant
 unknown offset and requires orientation to stay within three degrees of the first

@@ -104,14 +104,22 @@ def calibrate(args):
 
     from examples.cfg.lite6_tablet import Lite6TabletStation
 
+    station = Lite6TabletStation()
     offset_mm = getattr(args, "tip_offset_mm", None)
     if offset_mm is None:
-        offset_mm = Lite6TabletStation().tip_offset_mm
+        offset_mm = station.tip_offset_mm
     tip_offset = None if offset_mm is None else np.asarray(offset_mm, dtype=float) * 0.001
     if tip_offset is not None and (tip_offset.shape != (3,) or not np.isfinite(tip_offset).all()):
         raise ValueError("tip_offset_mm requires three finite numbers in the reported TCP frame.")
+    repeats = getattr(station, "calibration_repeats", 2) if tip_offset is not None else 1
+    tolerance_mm = getattr(station, "calibration_max_discrepancy_mm", 2.0)
+    if not isinstance(repeats, int) or repeats < 1:
+        raise ValueError("calibration_repeats must be a positive integer.")
+    if not np.isfinite(tolerance_mm) or tolerance_mm <= 0:
+        raise ValueError("calibration_max_discrepancy_mm must be finite and positive.")
     arm = XArmAPI(args.robot_ip, is_radian=True, do_not_open=True)
     poses = []
+    groups = []
     guiding_changed = False
     hold_error = None
     try:
@@ -128,7 +136,7 @@ def calibrate(args):
         _sdk_ok(arm.set_mode(2), "Enabling gravity-compensated hand guiding")
         _sdk_ok(arm.set_state(0), "Starting hand guiding")
         print(
-            "Hand guiding is enabled (mode 2). Move the arm by hand to teach three TCP contact poses.\n"
+            "Hand guiding is enabled (mode 2). Move the arm by hand to teach the three marked corners.\n"
             "Motors remain enabled for gravity compensation; no pose trajectories are sent.\n"
             "The corners define the actual drawing rectangle, not necessarily the full sheet."
         )
@@ -139,27 +147,41 @@ def calibrate(args):
                 f"TCP-to-tip offset: {offset_mm} mm in the reported TCP frame. Wrist orientation may change.\n"
                 "Choose the desired drawing orientation at the LAST corner; drawing will keep that orientation."
             )
-        for label in ("origin (tablet top-left)", "+U corner (tablet top-right)", "+V corner (tablet bottom-left)"):
-            input(f"Place pen in light contact at {label}, then press Enter: ")
-            code, errors = arm.get_err_warn_code()
-            _sdk_ok(code, "Checking controller before recording contact")
-            if any(errors):
-                raise RuntimeError(
-                    f"Calibration stopped: controller error/warning {errors}. Resolve it in Studio before retrying."
+            if repeats > 1:
+                print(
+                    f"Re-touch each marked corner {repeats} times, changing wrist tilt but keeping the tip at the SAME point.\n"
+                    f"Maximum permitted tip-position discrepancy per corner: {tolerance_mm:g} mm."
                 )
-            code, values = arm.get_position_aa(is_radian=True)
-            if code != 0:
-                raise RuntimeError(f"Reading robot TCP pose failed: {code}")
-            pose = np.asarray(values, dtype=float)
-            pose[:3] *= 0.001  # SDK millimeters -> RIO meters; rotation is already axis-angle/radians.
-            if pose.shape != (6,) or not np.isfinite(pose).all():
-                raise ValueError("Robot returned an invalid TCP pose.")
-            if poses and tip_offset is None:
-                angle = (Rotation.from_rotvec(poses[0][3:]).inv() * Rotation.from_rotvec(pose[3:])).magnitude()
-                if angle > np.deg2rad(3):
-                    raise ValueError("Unknown tip offset: keep orientation within 3 degrees or supply --tip-offset-mm X Y Z.")
-            poses.append(pose)
-            print(f"TCP: {pose.tolist()}")
+        for label in ("origin (tablet top-left)", "+U corner (tablet top-right)", "+V corner (tablet bottom-left)"):
+            group = []
+            for repeat in range(repeats):
+                input(f"Place pen in light contact at {label} ({repeat + 1}/{repeats}), then press Enter: ")
+                code, errors = arm.get_err_warn_code()
+                _sdk_ok(code, "Checking controller before recording contact")
+                if any(errors):
+                    raise RuntimeError(
+                        f"Calibration stopped: controller error/warning {errors}. Resolve it in Studio before retrying."
+                    )
+                code, values = arm.get_position_aa(is_radian=True)
+                if code != 0:
+                    raise RuntimeError(f"Reading robot TCP pose failed: {code}")
+                pose = np.asarray(values, dtype=float)
+                pose[:3] *= 0.001  # SDK millimeters -> RIO meters; orientation is axis-angle/radians.
+                if pose.shape != (6,) or not np.isfinite(pose).all():
+                    raise ValueError("Robot returned an invalid TCP pose.")
+                if poses and tip_offset is None:
+                    angle = (Rotation.from_rotvec(poses[0][3:]).inv() * Rotation.from_rotvec(pose[3:])).magnitude()
+                    if angle > np.deg2rad(3):
+                        raise ValueError(
+                            "Unknown tip offset: keep orientation within 3 degrees or supply --tip-offset-mm X Y Z."
+                        )
+                poses.append(pose)
+                group.append(pose)
+                print(f"TCP: {pose.tolist()}")
+                if tip_offset is not None:
+                    tip = pose[:3] + Rotation.from_rotvec(pose[3:]).apply(tip_offset)
+                    print(f"Computed tip XYZ (mm): {(tip * 1000).round(3).tolist()}")
+            groups.append(group)
     finally:
         try:
             if guiding_changed:
@@ -175,7 +197,15 @@ def calibrate(args):
             arm.disconnect()
     if hold_error is not None:
         raise RuntimeError(f"Calibration not saved because restoring position hold failed: {hold_error}")
-    calibration = PaperCalibration.from_contact_poses(poses, tip_offset)
+    if tip_offset is not None and repeats > 1:
+        calibration = PaperCalibration.from_repeated_contacts(groups, tip_offset, tolerance_mm * 0.001)
+        for check in calibration.contact_checks or []:
+            print(
+                f"{check['corner']}: XYZ discrepancy={check['max_discrepancy_mm']:.3f} mm; "
+                f"Z spread={check['z_spread_mm']:.3f} mm"
+            )
+    else:
+        calibration = PaperCalibration.from_contact_poses(poses, tip_offset)
     # For a desktop drawing surface, clearance points toward base +Z.
     calibration.normal_sign = 1 if calibration.normal[2] >= 0 else -1
     if args.flip_normal:
