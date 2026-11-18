@@ -232,7 +232,7 @@ def test_tilt_requires_known_offset_and_valid_axes(paper):
         controller.add_sample(TabletSample(0.5, 0.5, True))
 
 
-def test_run_defaults_enable_live_tilt_and_remove_driver_speed_caps(paper, tmp_path, monkeypatch):
+def test_run_defaults_disable_tilt_and_keep_live_button_clutch(paper, tmp_path, monkeypatch):
     paper.tip_offset_m = [0, 0, 0.184]
     paper.save(tmp_path / "paper.json")
     tablet = SimpleNamespace(tilt_supported=True, buttons_supported=(True, True))
@@ -259,7 +259,7 @@ def test_run_defaults_enable_live_tilt_and_remove_driver_speed_caps(paper, tmp_p
     )
     with pytest.raises(RuntimeError, match="configuration inspected"):
         run(args)
-    assert args.follow_tilt and args.realtime and args.lift_speed_mm_s == 2.0
+    assert not args.follow_tilt and args.realtime and args.lift_speed_mm_s == 2.0
     assert args.button_clutch and args.clutch_button == 1
     assert np.isinf(captured[0].arm_cfg.cfg["max_pos_speed"])
     assert np.isinf(captured[0].arm_cfg.cfg["max_rot_speed"])

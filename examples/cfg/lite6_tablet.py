@@ -51,7 +51,7 @@ class Lite6TabletStation:
     # Live lateral/upward/tilt targets; only downward tip approach is speed-limited.
     realtime: bool = True
     down_speed_mm_s: float = 2.0
-    follow_pen_tilt: bool = True
+    follow_pen_tilt: bool = False
     tilt_limit_deg: float = 60.0
     tilt_speed_deg_s: float = 30.0  # Used only when realtime=False.
     pen_axis_tcp: tuple[float, float, float] = (0.0, 0.0, -1.0)  # Tip toward pen body.

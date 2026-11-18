@@ -305,12 +305,12 @@ retracts along the paper normal, then follows the tablet:
 - Ctrl+C, device disconnect, event loss, or queue overflow: discard unfinished strokes,
   attempt a vertical retract from measured position, then save the recording.
 
-Clearance defaults to 5 mm. The station now enables live targets and tilt following
-by default. Edit these values in `examples/cfg/lite6_tablet.py`:
+Clearance defaults to 5 mm. The station enables live targets and button clutching;
+tilt following is disabled by default. Edit these values in `examples/cfg/lite6_tablet.py`:
 
 ```python
 realtime: bool = True
-follow_pen_tilt: bool = True
+follow_pen_tilt: bool = False
 down_speed_mm_s: float = 2.0
 tilt_limit_deg: float = 60.0
 pen_axis_tcp: tuple[float, float, float] = (0.0, 0.0, -1.0)

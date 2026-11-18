@@ -491,7 +491,7 @@ def run(args):
             raise ValueError(f"Unknown station: {args.station}")
         station = getattr(cfg, args.station)()
     if getattr(args, "follow_tilt", None) is None:
-        args.follow_tilt = getattr(station, "follow_pen_tilt", True)
+        args.follow_tilt = getattr(station, "follow_pen_tilt", False)
     if getattr(args, "realtime", None) is None:
         args.realtime = getattr(station, "realtime", True)
     if args.lift_speed_mm_s is None:
