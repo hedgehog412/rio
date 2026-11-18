@@ -298,8 +298,9 @@ uv run -m examples.teleop_tablet run \
 Lift the stylus before pressing Enter. Pre-session events are discarded. The arm first
 retracts along the paper normal, then follows the tablet:
 
-- Tip down: travel above the stroke start, lower to the taught contact plane, draw.
-- Tip up: lift at the last contact point before traveling to the next stroke.
+- Tip down: acquire the stylus position smoothly above the paper; touching alone never enables live tracking.
+- READY: press and release stylus button 1, hold still through LOWERING, then draw after LIVE TRACKING appears.
+- Tip up: immediately disable live tracking, discard pending drawing, and lift vertically from the measured tip position.
 - Out of proximity/cropped region: end the current stroke and lift.
 - Ctrl+C, device disconnect, event loss, or queue overflow: discard unfinished strokes,
   attempt a vertical retract from measured position, then save the recording.
@@ -314,9 +315,35 @@ down_speed_mm_s: float = 2.0
 tilt_limit_deg: float = 60.0
 pen_axis_tcp: tuple[float, float, float] = (0.0, 0.0, -1.0)
 tilt_signs: tuple[float, float] = (1.0, 1.0)
+button_clutch: bool = True
+clutch_button: int = 1
+clutch_position_speed_mm_s: float = 20.0
+clutch_rotation_speed_deg_s: float = 15.0
 ```
 
-In live mode there is no configured lateral/upward/rotational speed cap. The driver
+With the default button clutch, each stroke follows this sequence:
+
+1. Place the stylus at its start point, touching the tablet. The robot positions
+   the physical tip above that point, including tilt, using the acquisition speeds.
+2. Wait for `READY`. This requires measured position within 0.5 mm and angle within
+   0.5 degrees of the latest target. Press the configured button only after READY.
+3. Hold the stylus still during `LOWERING`. The approach retains the configured
+   downward speed limit; live tracking begins only after measured arrival.
+4. Draw when `LIVE TRACKING` appears. The button latches this stroke; holding it
+   down is unnecessary. Lifting the stylus, leaving proximity, or leaving the mapped
+   area disables tracking and requires positioning plus a fresh button press again.
+
+An early press is ignored and must be released and pressed again after READY.
+Holding a button across a lift never enables the next stroke. The other stylus
+button has no clutch effect. Readiness is rechecked against the latest target and
+feedback on every press. During acquisition and lowering, changing targets stay
+speed-limited instead of accumulating old points or jumping into live motion.
+A stationary pen normally emits no evdev events; silence alone does not reset a
+stroke. Explicit tip-up/proximity-loss events reset it; device disconnect or dropped
+input events stop the run and retract through normal cleanup. `--no-button-clutch`
+restores the previous touch-to-draw behavior when explicitly requested.
+
+After clutch engagement, live mode has no configured lateral/upward/rotational speed cap. The driver
 interpolates live targets and the robot's physical limits still apply; actual motion
 cannot be guaranteed to match arbitrary hand motion. Only the tip's motion toward
 the sheet is limited by `down_speed_mm_s`, or `--lift-speed-mm-s` for one run.
@@ -340,8 +367,9 @@ queued playback. In capped mode `--speed-mm-s` limits travel/drawing (default 20
 The rigid mount uses the exact taught contact plane; the software does not intentionally
 push below it and cannot compensate for paper movement or measure contact force.
 
-Live mode replaces superseded continuous drawing targets with the newest sample;
-pen-up/down boundaries remain ordered so separate strokes are not joined. Capped
+Live mode replaces superseded continuous drawing targets with the newest sample.
+With the clutch enabled, tip-up cancels unfinished targets and retracts at the actual
+measured position, preventing a delayed segment from joining strokes. Capped
 mode queues every report. `--max-queue` defaults to 10000; exhausting the transition
 queue stops the session. Arrival gates require position within 0.5 mm and orientation
 within 0.5 degrees. The 10 mm/5 degree lag guards apply only to capped playback;

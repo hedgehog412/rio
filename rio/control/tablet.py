@@ -326,6 +326,10 @@ class DrawingController:
         tilt_speed: float = np.deg2rad(30),
         pen_axis_tcp: tuple[float, float, float] = (0.0, 0.0, -1.0),
         tilt_signs: tuple[float, float] = (1.0, 1.0),
+        button_clutch: bool = False,
+        clutch_button: int = 1,
+        clutch_position_speed: float = 0.02,
+        clutch_rotation_speed: float = np.deg2rad(15),
     ):
         if not all(
             np.isfinite(x) and x > 0
@@ -349,6 +353,19 @@ class DrawingController:
         self.follow_tilt, self.realtime = follow_tilt, realtime
         self.tilt_limit_deg, self.tilt_speed = tilt_limit_deg, tilt_speed
         self.pen_axis_tcp, self.tilt_signs = axis / np.linalg.norm(axis), signs
+        if clutch_button not in (1, 2) or not all(
+            np.isfinite(x) and x > 0 for x in (clutch_position_speed, clutch_rotation_speed)
+        ):
+            raise ValueError("Clutch needs button 1 or 2 and finite positive positioning speeds.")
+        self.button_clutch, self.clutch_button = button_clutch, clutch_button
+        self.clutch_position_speed, self.clutch_rotation_speed = clutch_position_speed, clutch_rotation_speed
+        self.clutch_state = "waiting"
+        self._clutch_target: np.ndarray | None = None
+        self._clutch_rotation: np.ndarray | None = None
+        self._clutch_touching = False
+        self._clutch_button_down = False
+        self._clutch_button_released = False
+        self._clutch_retracting = button_clutch
         hover_height = draw_height + clearance
         drawing_pose = calibration.drawing_pose(start_pose)
         calibration.validate_start(drawing_pose, hover_height)
@@ -438,7 +455,68 @@ class DrawingController:
             return
         self.queue.append(self.Waypoint(np.array(position, dtype=float), phase, gate, np.array(rotation)))
 
-    def add_sample(self, sample: TabletSample):
+    @property
+    def clutch_status(self) -> str:
+        if not self.button_clutch:
+            return "disabled"
+        if self.aligning:
+            return "aligning"
+        if self._clutch_retracting:
+            return "lifting"
+        return self.clutch_state
+
+    def _clutch_at_target(self, pose, height) -> bool:
+        if self._clutch_target is None or self._clutch_rotation is None:
+            return False
+        reference = self.calibration.drawing_pose(pose)
+        goal = self._clutch_target + height * self.calibration.normal
+        angle = (Rotation.from_rotvec(pose[3:]).inv() * Rotation.from_rotvec(self._clutch_rotation)).magnitude()
+        return bool(np.linalg.norm(reference[:3] - goal) <= self.arrival_tolerance and angle <= np.deg2rad(0.5))
+
+    def _add_clutch_sample(self, sample, measured_pose):
+        pressed = sample.button1 if self.clutch_button == 1 else sample.button2
+        rising = pressed and not self._clutch_button_down
+        self._clutch_button_down = pressed
+        surface = self.calibration.map_sample(sample)
+        engaged = self.clutch_state in ("lowering", "tracking")
+        if engaged and (not sample.touching or surface is None):
+            self.retract(measured_pose)  # Discard pending drawing and lift at measured tip, preserving wrist angle.
+            self._clutch_button_released = False
+        if surface is None:
+            if self._clutch_target is not None and not self._clutch_retracting:
+                self.retract(measured_pose)
+            self._clutch_target = self._clutch_rotation = None
+            self._clutch_touching = False
+            self._clutch_button_released = False
+            self.clutch_state = "waiting"
+            return
+        self._clutch_target = surface.copy()
+        self._clutch_rotation = (
+            self.calibration.tilt_rotation(sample, self.pen_axis_tcp, self.tilt_signs, self.tilt_limit_deg)
+            if self.follow_tilt
+            else np.asarray(self.calibration.rotvec).copy()
+        )
+        self._clutch_touching = sample.touching
+        if not pressed:
+            self._clutch_button_released = True
+        if self.clutch_state not in ("lowering", "tracking"):
+            pose = np.r_[self.position, self.rotvec] if measured_pose is None else measured_pose
+            matched = not self.aligning and not self._clutch_retracting and self._clutch_at_target(pose, self.hover_height)
+            self.clutch_state = ("ready" if sample.touching else "hover-ready") if matched else "positioning"
+            if rising:
+                if self._clutch_button_released and matched and sample.touching:
+                    self.clutch_state = "lowering"
+                self._clutch_button_released = False  # Early presses are consumed, never deferred.
+        if self.clutch_state == "tracking":
+            self._append(surface + self.draw_height * self.calibration.normal, "draw", rotvec=self._clutch_rotation)
+            self.planned_surface = surface.copy()
+            self.planned_rotvec = self._clutch_rotation.copy()
+            self.touching = True
+
+    def add_sample(self, sample: TabletSample, measured_pose: np.ndarray | None = None):
+        if self.button_clutch:
+            self._add_clutch_sample(sample, measured_pose)
+            return
         surface = self.calibration.map_sample(sample)
         touching = sample.touching and surface is not None
         normal = self.calibration.normal
@@ -472,6 +550,12 @@ class DrawingController:
             self.position = np.array(measured_pose[:3], dtype=float)
             self.rotvec = np.array(measured_pose[3:], dtype=float)
         self.aligning = False
+        if self.button_clutch:
+            self.clutch_state = "waiting"
+            self._clutch_target = self._clutch_rotation = None
+            self._clutch_touching = False
+            self._clutch_button_released = False
+            self._clutch_retracting = True
         self.queue.clear()
         self.touching = False
         height = self.calibration.coordinates(self.calibration.drawing_pose(np.r_[self.position, self.rotvec])[:3])[2]
@@ -489,6 +573,22 @@ class DrawingController:
             measured_position = measured_pose[:3]
         if self.aligning:
             return self._alignment_step(dt, measured_pose)
+        preparing = self.button_clutch and not self._clutch_retracting and self.clutch_state != "tracking"
+        height = self.hover_height
+        if preparing and self._clutch_target is not None:
+            actual = np.r_[self.position, self.rotvec] if measured_pose is None else measured_pose
+            if self.clutch_state in ("ready", "hover-ready") and not self._clutch_at_target(actual, self.hover_height):
+                self.clutch_state = "positioning"
+            self.queue.clear()  # A single moving acquisition target, never a playback queue.
+            height = self.draw_height if self.clutch_state == "lowering" else self.hover_height
+            self._append(
+                self._clutch_target + height * self.calibration.normal,
+                "lower" if self.clutch_state == "lowering" else "positioning",
+                True,
+                self._clutch_rotation,
+            )
+        elif preparing:
+            return np.r_[self.position, self.rotvec]
         remaining = dt
         while self.queue:
             waypoint = self.queue[0]
@@ -502,7 +602,14 @@ class DrawingController:
             turn = (goal * rotation.inv()).as_rotvec()
             angle = float(np.linalg.norm(turn))
             offset = np.asarray(self.calibration.tip_offset_m if self.calibration.tip_offset_m is not None else [0, 0, 0])
-            if self.realtime:
+            if preparing:
+                duration = max(
+                    (distance + np.linalg.norm(offset) * angle) / self.clutch_position_speed,
+                    angle / self.clutch_rotation_speed,
+                    max(0.0, -float(delta @ self.calibration.normal)) / self.lift_speed,
+                )
+                fraction = min(1.0, remaining / max(duration, 1e-15))
+            elif self.realtime:
                 duration = max(0.0, -float(delta @ self.calibration.normal)) / self.lift_speed
                 fraction = min(1.0, remaining / max(duration, 1e-15), np.deg2rad(5) / max(angle, 1e-15))
             else:
@@ -527,4 +634,13 @@ class DrawingController:
             # Give the backend a complete cycle at every contact transition.
             if waypoint.gate or remaining <= 0:
                 break
+        if self.button_clutch and not self.queue:
+            if self._clutch_retracting:
+                self._clutch_retracting = False
+            elif preparing and self._clutch_target is not None:
+                pose = np.r_[self.position, self.rotvec] if measured_pose is None else measured_pose
+                if self._clutch_at_target(pose, height):
+                    self.clutch_state = (
+                        "tracking" if self.clutch_state == "lowering" else ("ready" if self._clutch_touching else "hover-ready")
+                    )
         return np.concatenate((self.position, self.rotvec))

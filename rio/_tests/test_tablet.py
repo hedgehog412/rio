@@ -44,6 +44,129 @@ from rio.embodiments.single_arm import SingleArm
 pytestmark = pytest.mark.unit
 
 
+def clutch_sample(u=0.25, v=0.75, touching=True, button=1, pressed=False, proximity=True):
+    return TabletSample(
+        u,
+        v,
+        touching,
+        proximity=proximity,
+        tilt_x_deg=15,
+        tilt_y_deg=-10,
+        button1=pressed if button == 1 else False,
+        button2=pressed if button == 2 else False,
+    )
+
+
+def settle_clutch(controller, pose, status):
+    for _ in range(10000):
+        pose = controller.step(0.02, measured_pose=pose)
+        if controller.clutch_status == status:
+            return pose
+    pytest.fail(f"Did not reach clutch state {status}; got {controller.clutch_status}")
+
+
+def make_clutch(paper, button=1):
+    paper.tip_offset_m = [0, 0, 0.184]
+    pose = np.r_[paper.map_sample(TabletSample(0.5, 0.5, False)) + 0.015 * paper.normal, paper.rotvec]
+    controller = DrawingController(
+        paper,
+        pose,
+        button_clutch=True,
+        clutch_button=button,
+        realtime=True,
+        follow_tilt=True,
+        draw_height=0.01,
+        lift_speed=0.002,
+    )
+    return controller, settle_clutch(controller, pose, "waiting")
+
+
+@pytest.mark.parametrize("button", [1, 2])
+def test_button_clutch_positions_smoothly_and_requires_ready_fresh_press(paper, button):
+    controller, pose = make_clutch(paper, button)
+    controller.add_sample(clutch_sample(button=button, pressed=True), measured_pose=pose)
+    previous = pose.copy()
+    pose = controller.step(0.02, measured_pose=pose)
+    assert np.linalg.norm(pose[:3] - previous[:3]) <= 0.02 * 0.02 + 1e-12
+    assert controller.clutch_state == "positioning"
+    pose = settle_clutch(controller, pose, "ready")
+    for _ in range(10):
+        controller.add_sample(clutch_sample(button=button, pressed=True), measured_pose=pose)
+        pose = controller.step(0.02, measured_pose=pose)
+    assert controller.clutch_state == "ready"  # Early press and held button cannot arm later.
+    assert paper.coordinates(paper.drawing_pose(pose)[:3])[2] == pytest.approx(0.015)
+    controller.add_sample(clutch_sample(button=button), measured_pose=pose)
+    controller.add_sample(clutch_sample(button=button, pressed=True), measured_pose=pose)
+    assert controller.clutch_state == "lowering"
+    before = paper.coordinates(paper.drawing_pose(pose)[:3])[2]
+    commanded = controller.step(0.02, measured_pose=pose)
+    after = paper.coordinates(paper.drawing_pose(commanded)[:3])[2]
+    assert before - after <= 0.002 * 0.02 + 1e-12
+    pose = settle_clutch(controller, commanded, "tracking")
+    controller.add_sample(clutch_sample(0.8, 0.8, button=button), measured_pose=pose)
+    pose = controller.step(0.02, measured_pose=pose)
+    np.testing.assert_allclose(paper.coordinates(paper.drawing_pose(pose)[:3]), [0.8, 0.8, 0.01], atol=1e-10)
+
+
+@pytest.mark.parametrize("lost_proximity", [False, True])
+def test_lift_discards_pending_live_targets_and_requires_button_again(paper, lost_proximity):
+    controller, pose = make_clutch(paper)
+    controller.add_sample(clutch_sample(), measured_pose=pose)
+    pose = settle_clutch(controller, pose, "ready")
+    controller.add_sample(clutch_sample(pressed=True), measured_pose=pose)
+    pose = settle_clutch(controller, pose, "tracking")
+    actual = pose.copy()
+    controller.add_sample(clutch_sample(0.8, 0.8, pressed=True), measured_pose=actual)
+    controller.step(0.02, measured_pose=actual)  # Hardware may still be at the old point.
+    controller.add_sample(
+        clutch_sample(0.9, 0.9, touching=False, pressed=True, proximity=not lost_proximity), measured_pose=actual
+    )
+    assert controller.clutch_status == "lifting"
+    np.testing.assert_allclose(controller.position, actual[:3])
+    np.testing.assert_allclose(paper.coordinates(controller.queue[0].position), [0.25, 0.75, 0.015], atol=1e-10)
+    assert len(controller.queue) == 1
+    pose = settle_clutch(controller, actual, "waiting" if lost_proximity else "positioning")
+    controller.add_sample(clutch_sample(pressed=True), measured_pose=pose)
+    pose = settle_clutch(controller, pose, "ready")
+    assert controller.clutch_state == "ready"  # Holding across the lift never re-arms.
+    controller.add_sample(clutch_sample(), measured_pose=pose)
+    controller.add_sample(clutch_sample(pressed=True), measured_pose=pose)
+    assert controller.clutch_state == "lowering"
+
+
+def test_clutch_rechecks_latest_target_and_real_feedback_before_accepting_button(paper):
+    controller, pose = make_clutch(paper)
+    controller.add_sample(clutch_sample(), measured_pose=pose)
+    pose = settle_clutch(controller, pose, "ready")
+    drifted = pose.copy()
+    drifted[:3] += 0.01 * paper.axes[:, 0] / np.linalg.norm(paper.axes[:, 0])
+    controller.step(0.02, measured_pose=drifted)
+    assert controller.clutch_state == "positioning"
+    controller.add_sample(clutch_sample(0.9, 0.1, pressed=True), measured_pose=pose)
+    assert controller.clutch_state == "positioning"  # Cached READY does not apply to a different point.
+    for _ in range(1000):
+        controller.step(0.02, measured_pose=pose)  # Fresh but unmoving hardware feedback.
+    assert controller.clutch_state == "positioning"
+
+
+def test_lift_during_lowering_cancels_contact_and_stationary_pen_does_not_disarm(paper):
+    controller, pose = make_clutch(paper)
+    controller.add_sample(clutch_sample(), measured_pose=pose)
+    pose = settle_clutch(controller, pose, "ready")
+    controller.add_sample(clutch_sample(pressed=True), measured_pose=pose)
+    commanded = controller.step(0.02, measured_pose=pose)
+    controller.add_sample(clutch_sample(touching=False, pressed=False), measured_pose=commanded)
+    assert controller.clutch_status == "lifting"
+    pose = settle_clutch(controller, commanded, "positioning")
+    controller.add_sample(clutch_sample(), measured_pose=pose)
+    pose = settle_clutch(controller, pose, "ready")
+    controller.add_sample(clutch_sample(pressed=True), measured_pose=pose)
+    pose = settle_clutch(controller, pose, "tracking")
+    for _ in range(300):
+        pose = controller.step(0.02, measured_pose=pose)  # No evdev frames is normal for a stationary pen.
+    assert controller.clutch_status == "tracking"
+
+
 def test_decoder_preserves_tilt_only_and_partial_axis_reports():
     decoder = TabletEvents((0, 100), (0, 100), tilt_supported=True)
     first = decoder.feed(packet((EV_ABS, ABS_TILT_X, -23), (EV_ABS, ABS_TILT_Y, 31)))[0]
@@ -112,7 +235,7 @@ def test_tilt_requires_known_offset_and_valid_axes(paper):
 def test_run_defaults_enable_live_tilt_and_remove_driver_speed_caps(paper, tmp_path, monkeypatch):
     paper.tip_offset_m = [0, 0, 0.184]
     paper.save(tmp_path / "paper.json")
-    tablet = SimpleNamespace(tilt_supported=True)
+    tablet = SimpleNamespace(tilt_supported=True, buttons_supported=(True, True))
     monkeypatch.setattr(entrypoint, "LinuxTablet", lambda _: nullcontext(tablet))
     captured = []
 
@@ -137,6 +260,7 @@ def test_run_defaults_enable_live_tilt_and_remove_driver_speed_caps(paper, tmp_p
     with pytest.raises(RuntimeError, match="configuration inspected"):
         run(args)
     assert args.follow_tilt and args.realtime and args.lift_speed_mm_s == 2.0
+    assert args.button_clutch and args.clutch_button == 1
     assert np.isinf(captured[0].arm_cfg.cfg["max_pos_speed"])
     assert np.isinf(captured[0].arm_cfg.cfg["max_rot_speed"])
 
@@ -1217,6 +1341,7 @@ def test_run_retracts_and_saves_after_interrupt_or_disconnect(paper, tmp_path, m
         air_gap_mm=air_gap_mm,
         follow_tilt=False,
         realtime=False,
+        button_clutch=False,
     )
     if failure is ConnectionError:
         with pytest.raises(ConnectionError):

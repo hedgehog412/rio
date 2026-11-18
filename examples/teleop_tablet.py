@@ -346,6 +346,10 @@ def make_controller(args, calibration: PaperCalibration, pose: np.ndarray) -> Dr
         tilt_speed=np.deg2rad(getattr(args, "tilt_speed_deg_s", 30.0)),
         pen_axis_tcp=getattr(args, "pen_axis_tcp", (0.0, 0.0, -1.0)),
         tilt_signs=getattr(args, "tilt_signs", (1.0, 1.0)),
+        button_clutch=bool(getattr(args, "button_clutch", False)),
+        clutch_button=getattr(args, "clutch_button", 1),
+        clutch_position_speed=getattr(args, "clutch_position_speed_mm_s", 20.0) * 0.001,
+        clutch_rotation_speed=np.deg2rad(getattr(args, "clutch_rotation_speed_deg_s", 15.0)),
     )
 
 
@@ -424,6 +428,8 @@ class RunMonitor:
             remaining = (Rotation.from_rotvec(measured[3:]).inv() * Rotation.from_rotvec(target)).magnitude()
             moved = np.linalg.norm(measured[:3] - self.initial[:3]) * 1000
             phase = controller.phase if controller.aligning or controller.queue else ("tracking" if pending else "ready")
+            if controller.button_clutch:
+                phase = controller.clutch_status
             print(
                 f"phase={phase}; TCP moved={moved:.2f} mm; tip height={height * 1000:+.2f} mm; "
                 f"wrist remaining={np.rad2deg(remaining):.2f} deg; "
@@ -461,6 +467,8 @@ def drawing_step(env, controller, dt, target_time, sample):
         "drawing_air_gap_m": controller.draw_height,
         "drawing_follow_tilt": controller.follow_tilt,
         "drawing_realtime": controller.realtime,
+        "drawing_clutch_state": controller.clutch_status,
+        "drawing_clutch_button": controller.clutch_button if controller.button_clutch else None,
     }
     if env.recorder:
         env.recorder.record_step(step)
@@ -488,7 +496,17 @@ def run(args):
         args.realtime = getattr(station, "realtime", True)
     if args.lift_speed_mm_s is None:
         args.lift_speed_mm_s = getattr(station, "down_speed_mm_s", 2.0)
-    for name in ("tilt_limit_deg", "tilt_speed_deg_s", "pen_axis_tcp", "tilt_signs"):
+    if getattr(args, "button_clutch", None) is None:
+        args.button_clutch = getattr(station, "button_clutch", True)
+    for name in (
+        "tilt_limit_deg",
+        "tilt_speed_deg_s",
+        "pen_axis_tcp",
+        "tilt_signs",
+        "clutch_button",
+        "clutch_position_speed_mm_s",
+        "clutch_rotation_speed_deg_s",
+    ):
         if hasattr(station, name):
             setattr(args, name, getattr(station, name))
     preview_pose = np.concatenate((np.asarray(calibration.origin), calibration.rotvec))
@@ -517,6 +535,10 @@ def run(args):
     with LinuxTablet(select_device(args.device)) as tablet:
         if args.follow_tilt and not getattr(tablet, "tilt_supported", False):
             raise ValueError("Selected pen node does not expose both tilt axes. Use --no-follow-tilt for fixed-angle drawing.")
+        if args.button_clutch:
+            buttons = getattr(tablet, "buttons_supported", (False, False))
+            if not buttons[args.clutch_button - 1]:
+                raise ValueError(f"Selected pen node does not expose clutch button {args.clutch_button}.")
         mp.set_start_method(station.mp_method, force=True)
         servers, _, env = make_env(station)
         with ServerManager(station.mw, [server for server in servers.values() if server is not None]), env:
@@ -545,6 +567,7 @@ def run(args):
             env.set_instruction(station.instruction)
             sample = TabletSample(0.0, 0.0, False, proximity=False)
             monitor = RunMonitor(measured, time.now())
+            last_clutch_status = None
             dt = 1 / args.freq
             trace = None
             if env.recorder:
@@ -558,11 +581,12 @@ def run(args):
                     tick_start = time.now()
                     reports = tablet.poll()
                     accept_input = input_ready and not controller.aligning
+                    input_pose = read_pose(env) if reports and controller.button_clutch else None
                     for sample in reports:
                         if trace:
                             trace.write(json.dumps({"received_at": time.now() - t_start, **asdict(sample)}) + "\n")
                         if accept_input:
-                            controller.add_sample(sample)
+                            controller.add_sample(sample, measured_pose=input_pose)
                     if not controller.aligning and not tablet.events.touching:
                         input_ready = True
                     was_aligning = controller.aligning
@@ -570,7 +594,20 @@ def run(args):
                     drawing_step(env, controller, dt, time.now() + lead + station.arm_latency, sample)
                     monitor.update(controller, read_pose(env), sample, len(reports), time.now())
                     if was_aligning and not controller.aligning:
-                        print("Wrist aligned. Lift the stylus, then begin drawing.")
+                        print("Wrist aligned. Lift the stylus, then place it at the stroke start.")
+                    if controller.button_clutch and controller.clutch_status != last_clutch_status:
+                        last_clutch_status = controller.clutch_status
+                        messages = {
+                            "ready": f"READY: hold the stylus at this point and press button {controller.clutch_button}.",
+                            "hover-ready": "Position matched above the paper. Touch the tablet and wait for READY.",
+                            "lowering": "Button accepted. Lowering the pen; hold the stylus still until LIVE TRACKING.",
+                            "tracking": "LIVE TRACKING enabled. Lift the stylus to end the stroke and reset the clutch.",
+                            "positioning": "Positioning above the stylus smoothly. Wait for READY before pressing the button.",
+                            "waiting": "Waiting for stylus proximity. Each stroke requires a fresh button press.",
+                            "lifting": "Lifting clear; live tracking is disabled.",
+                        }
+                        if last_clutch_status in messages:
+                            print(messages[last_clutch_status], flush=True)
                     time.precise_wait(tick_start + dt)
             except KeyboardInterrupt:
                 logger.info("Drawing stopped; retracting.")
@@ -634,6 +671,12 @@ def main():
             help="Downward approach speed in live mode; lift/lower speed otherwise. Defaults to station down_speed_mm_s.",
         )
         child.add_argument("--max-queue", type=int, default=10000)
+        child.add_argument(
+            "--button-clutch",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Require a fresh stylus button press after positioning for every stroke (station default).",
+        )
         child.add_argument(
             "--follow-tilt",
             action=argparse.BooleanOptionalAction,

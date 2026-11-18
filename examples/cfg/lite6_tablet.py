@@ -56,3 +56,7 @@ class Lite6TabletStation:
     tilt_speed_deg_s: float = 30.0  # Used only when realtime=False.
     pen_axis_tcp: tuple[float, float, float] = (0.0, 0.0, -1.0)  # Tip toward pen body.
     tilt_signs: tuple[float, float] = (1.0, 1.0)  # Positive lean toward paper +U, +V.
+    button_clutch: bool = True
+    clutch_button: int = 1  # Fresh press after positioning, for every stroke.
+    clutch_position_speed_mm_s: float = 20.0
+    clutch_rotation_speed_deg_s: float = 15.0
