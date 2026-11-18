@@ -47,3 +47,12 @@ class Lite6TabletStation:
     calibration_mode: str = "plane"  # "repeat" optionally checks the same marked corners.
     calibration_surface_samples: int = 3
     calibration_plane_tolerance_mm: float = 2.0
+
+    # Live lateral/upward/tilt targets; only downward tip approach is speed-limited.
+    realtime: bool = True
+    down_speed_mm_s: float = 2.0
+    follow_pen_tilt: bool = True
+    tilt_limit_deg: float = 60.0
+    tilt_speed_deg_s: float = 30.0  # Used only when realtime=False.
+    pen_axis_tcp: tuple[float, float, float] = (0.0, 0.0, -1.0)  # Tip toward pen body.
+    tilt_signs: tuple[float, float] = (1.0, 1.0)  # Positive lean toward paper +U, +V.

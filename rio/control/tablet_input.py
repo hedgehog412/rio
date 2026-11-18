@@ -13,6 +13,7 @@ from .tablet import TabletSample
 EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
 SYN_REPORT, SYN_DROPPED = 0, 3
 ABS_X, ABS_Y, ABS_PRESSURE = 0, 1, 24
+ABS_TILT_X, ABS_TILT_Y = 26, 27
 BTN_TOOL_PEN, BTN_TOUCH = 320, 330
 BTN_STYLUS, BTN_STYLUS2 = 331, 332
 INPUT_EVENT = struct.Struct("@llHHi")
@@ -28,11 +29,20 @@ def _read_ioctl(fd: int, number: int, size: int) -> bytes:
 class TabletEvents:
     """Decode complete SYN_REPORT frames; never confuse proximity with contact."""
 
-    def __init__(self, x_range: tuple[int, int], y_range: tuple[int, int], pressure_range: tuple[int, int] = (0, 1)):
+    def __init__(
+        self,
+        x_range: tuple[int, int],
+        y_range: tuple[int, int],
+        pressure_range: tuple[int, int] = (0, 1),
+        tilt_supported: bool = False,
+    ):
         if any(hi <= lo for lo, hi in (x_range, y_range, pressure_range)):
             raise ValueError("Tablet axis ranges must be increasing.")
         self.ranges = {ABS_X: x_range, ABS_Y: y_range, ABS_PRESSURE: pressure_range}
         self.values = {ABS_X: x_range[0], ABS_Y: y_range[0], ABS_PRESSURE: pressure_range[0]}
+        self.tilt_supported = tilt_supported
+        if tilt_supported:
+            self.values.update({ABS_TILT_X: 0, ABS_TILT_Y: 0})
         self.touching = False
         self.proximity = False
         self.button1 = False
@@ -69,6 +79,8 @@ class TabletEvents:
                         timestamp=seconds + micros * 1e-6,
                         button1=self.button1,
                         button2=self.button2,
+                        tilt_x_deg=float(self.values[ABS_TILT_X]) if self.tilt_supported else None,
+                        tilt_y_deg=float(self.values[ABS_TILT_Y]) if self.tilt_supported else None,
                     )
                 )
         return reports
@@ -92,7 +104,18 @@ class LinuxTablet:
                 pressure_range = (pressure[1], pressure[2]) if pressure[2] > pressure[1] else (0, 1)
             except OSError:
                 pressure_range = (0, 1)
-            self.events = TabletEvents((x[1], x[2]), (y[1], y[2]), pressure_range)
+            tilt = {}
+            for axis in (ABS_TILT_X, ABS_TILT_Y):
+                try:
+                    info = ABS_INFO.unpack(_read_ioctl(self.fd, 0x40 + axis, ABS_INFO.size))
+                    if info[1] < 0 < info[2]:
+                        tilt[axis] = info[0]
+                except OSError:
+                    pass
+            self.tilt_supported = len(tilt) == 2
+            self.events = TabletEvents((x[1], x[2]), (y[1], y[2]), pressure_range, self.tilt_supported)
+            if self.tilt_supported:
+                self.events.values.update(tilt)
             self.events.values.update({ABS_X: x[0], ABS_Y: y[0]})
             keys_now = _read_ioctl(self.fd, 0x18, 96)
             self.events.touching = bool(keys_now[BTN_TOUCH // 8] & (1 << (BTN_TOUCH % 8)))

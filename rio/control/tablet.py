@@ -22,6 +22,8 @@ class TabletSample:
     timestamp: float = 0.0
     button1: bool = False
     button2: bool = False
+    tilt_x_deg: float | None = None
+    tilt_y_deg: float | None = None
 
 
 @dataclass
@@ -123,6 +125,37 @@ class PaperCalibration:
         offset = np.asarray(self.tip_offset_m)
         tip = pose[:3] + Rotation.from_rotvec(pose[3:]).apply(offset)
         return np.r_[tip - Rotation.from_rotvec(self.rotvec).apply(offset), self.rotvec]
+
+    def tilt_rotation(self, sample: TabletSample, pen_axis_tcp, signs, limit_deg: float) -> np.ndarray:
+        """Map stylus body lean onto paper U/V, retaining the taught barrel twist."""
+        if sample.tilt_x_deg is None or sample.tilt_y_deg is None:
+            raise ValueError("Tilt following requires ABS_TILT_X and ABS_TILT_Y on the selected pen node.")
+        angles = np.asarray([sample.tilt_x_deg, sample.tilt_y_deg]) * signs
+        if not np.isfinite(angles).all() or np.any(np.abs(angles) >= 90):
+            raise ValueError("Stylus tilt must contain finite angles strictly between -90 and 90 degrees.")
+        u = self.axes[:, 0] / np.linalg.norm(self.axes[:, 0])
+        v = self.axes[:, 1] - np.dot(self.axes[:, 1], u) * u
+        v /= np.linalg.norm(v)
+        slope = np.tan(np.deg2rad(angles))
+        length = np.linalg.norm(slope)
+        slope *= min(1.0, np.tan(np.deg2rad(limit_deg)) / max(length, 1e-12))
+        target = self.normal + slope[0] * u + slope[1] * v
+        target /= np.linalg.norm(target)
+        reference = Rotation.from_rotvec(self.rotvec)
+        source = reference.apply(pen_axis_tcp)
+        axis = np.cross(source, target)
+        sine = np.linalg.norm(axis)
+        cosine = np.clip(np.dot(source, target), -1, 1)
+        if sine < 1e-10:
+            if cosine > 0:
+                return np.asarray(self.rotvec).copy()
+            axis = u - np.dot(u, source) * source
+            if np.linalg.norm(axis) < 1e-8:
+                axis = v - np.dot(v, source) * source
+            axis /= np.linalg.norm(axis)
+        else:
+            axis /= sine
+        return (Rotation.from_rotvec(axis * np.arctan2(sine, cosine)) * reference).as_rotvec()
 
     def save(self, path: str | Path):
         Path(path).write_text(json.dumps(asdict(self), indent=2) + "\n")
@@ -273,6 +306,7 @@ class DrawingController:
         position: np.ndarray
         phase: str
         gate: bool = False
+        rotvec: np.ndarray | None = None
 
     def __init__(
         self,
@@ -286,6 +320,12 @@ class DrawingController:
         draw_height: float = 0.0,
         alignment_clearance: float = 0.02,
         alignment_speed: float = np.deg2rad(3),
+        follow_tilt: bool = False,
+        realtime: bool = False,
+        tilt_limit_deg: float = 60.0,
+        tilt_speed: float = np.deg2rad(30),
+        pen_axis_tcp: tuple[float, float, float] = (0.0, 0.0, -1.0),
+        tilt_signs: tuple[float, float] = (1.0, 1.0),
     ):
         if not all(
             np.isfinite(x) and x > 0
@@ -296,6 +336,19 @@ class DrawingController:
             raise ValueError("max_queue must be at least four.")
         if not np.isfinite(draw_height) or draw_height < 0:
             raise ValueError("draw_height must be finite and nonnegative.")
+        if follow_tilt and calibration.tip_offset_m is None:
+            raise ValueError("Tilt following needs a known tip_offset_m saved in the calibration.")
+        axis = np.asarray(pen_axis_tcp, dtype=float)
+        signs = np.asarray(tilt_signs, dtype=float)
+        if axis.shape != (3,) or not np.isfinite(axis).all() or np.linalg.norm(axis) < 1e-8:
+            raise ValueError("pen_axis_tcp must be a finite nonzero three-element vector from tip toward pen body.")
+        if signs.shape != (2,) or not np.isfinite(signs).all() or not np.isin(signs, [-1, 1]).all():
+            raise ValueError("tilt_signs must be two values of +1 or -1.")
+        if not np.isfinite(tilt_limit_deg) or not 0 < tilt_limit_deg < 90 or not np.isfinite(tilt_speed) or tilt_speed <= 0:
+            raise ValueError("Tilt limit must be between 0 and 90 degrees and tilt_speed must be finite and positive.")
+        self.follow_tilt, self.realtime = follow_tilt, realtime
+        self.tilt_limit_deg, self.tilt_speed = tilt_limit_deg, tilt_speed
+        self.pen_axis_tcp, self.tilt_signs = axis / np.linalg.norm(axis), signs
         hover_height = draw_height + clearance
         drawing_pose = calibration.drawing_pose(start_pose)
         calibration.validate_start(drawing_pose, hover_height)
@@ -327,6 +380,7 @@ class DrawingController:
         self.arrival_tolerance = arrival_tolerance
         self.max_queue = max_queue
         self.queue: deque[DrawingController.Waypoint] = deque()
+        self.planned_rotvec = np.asarray(calibration.rotvec).copy()
         self.touching = False
         self.phase = "lift"
         self.planned_surface = drawing_pose[:3] - calibration.coordinates(drawing_pose[:3])[2] * calibration.normal
@@ -341,8 +395,9 @@ class DrawingController:
         if self.alignment_phase == "startup-lift":
             equivalent = self.calibration.drawing_pose(np.r_[self.position, self.rotvec])
             height = self.calibration.coordinates(equivalent[:3])[2]
-            self.position += max(0.0, min(self.alignment_height - height, self.lift_speed * dt)) * normal
-            if height + self.lift_speed * dt >= self.alignment_height - 1e-10:
+            step = float("inf") if self.realtime else self.lift_speed * dt
+            self.position += max(0.0, min(self.alignment_height - height, step)) * normal
+            if height + step >= self.alignment_height - 1e-10:
                 if measured_pose is None or np.linalg.norm(measured_pose[:3] - self.position) <= self.arrival_tolerance:
                     self.alignment_phase = "align"
         else:
@@ -351,6 +406,8 @@ class DrawingController:
             angle = np.linalg.norm(delta)
             # |d TCP| <= |offset| * d angle for a rotation about the tip.
             max_angle = min(self.alignment_speed, min(self.speed, self.lift_speed) / max(np.linalg.norm(offset), 1e-9)) * dt
+            if self.realtime:
+                max_angle = np.deg2rad(5)  # Subdivide rotations for continuous tip compensation.
             fraction = min(1.0, max_angle / max(angle, 1e-15))
             tip = self.position + rotation.apply(offset)
             updated = Rotation.from_rotvec(delta * fraction) * rotation
@@ -366,33 +423,45 @@ class DrawingController:
                     self.rotvec = np.asarray(self.calibration.rotvec).copy()
         return np.r_[self.position, self.rotvec]
 
-    def _append(self, position: np.ndarray, phase: str, gate: bool = False):
+    def _append(self, position: np.ndarray, phase: str, gate: bool = False, rotvec=None):
+        rotation = self.planned_rotvec if rotvec is None else np.asarray(rotvec)
+        if self.realtime and phase == "draw" and self.queue and self.queue[-1].phase == "draw":
+            self.queue.pop()  # Latest continuous stroke target; never replace lift/contact boundaries.
         if len(self.queue) >= self.max_queue:
             raise RuntimeError("Tablet backlog exceeded max_queue; drawing stopped rather than dropping strokes.")
-        if self.queue and phase == self.queue[-1].phase and np.linalg.norm(position - self.queue[-1].position) < 1e-9:
+        if (
+            self.queue
+            and phase == self.queue[-1].phase
+            and np.linalg.norm(position - self.queue[-1].position) < 1e-9
+            and (Rotation.from_rotvec(rotation).inv() * Rotation.from_rotvec(self.queue[-1].rotvec)).magnitude() < 1e-9
+        ):
             return
-        self.queue.append(self.Waypoint(np.array(position, dtype=float), phase, gate))
+        self.queue.append(self.Waypoint(np.array(position, dtype=float), phase, gate, np.array(rotation)))
 
     def add_sample(self, sample: TabletSample):
         surface = self.calibration.map_sample(sample)
         touching = sample.touching and surface is not None
         normal = self.calibration.normal
+        rotation = self.planned_rotvec
+        if self.follow_tilt and surface is not None:
+            rotation = self.calibration.tilt_rotation(sample, self.pen_axis_tcp, self.tilt_signs, self.tilt_limit_deg)
         if self.touching and not touching:
             # Lift at the LAST CONTACT location, not the new hover location.
             self._append(self.planned_surface + self.hover_height * normal, "lift", True)
         if surface is not None:
             if touching:
                 if not self.touching:
-                    self._append(surface + self.hover_height * normal, "travel", True)
-                    self._append(surface + self.draw_height * normal, "lower", True)
+                    self._append(surface + self.hover_height * normal, "travel", True, rotation)
+                    self._append(surface + self.draw_height * normal, "lower", True, rotation)
                 else:
-                    self._append(surface + self.draw_height * normal, "draw")
+                    self._append(surface + self.draw_height * normal, "draw", rotvec=rotation)
             else:
                 # Hover positions are replaceable; contact/lift waypoints are not.
                 if self.queue and self.queue[-1].phase == "travel":
                     self.queue.pop()
-                self._append(surface + self.hover_height * normal, "travel", True)
+                self._append(surface + self.hover_height * normal, "travel", True, rotation)
             self.planned_surface = surface
+            self.planned_rotvec = rotation.copy()
         self.touching = touching
 
     def retract(self, measured_pose: np.ndarray | None = None):
@@ -406,8 +475,10 @@ class DrawingController:
         self.queue.clear()
         self.touching = False
         height = self.calibration.coordinates(self.calibration.drawing_pose(np.r_[self.position, self.rotvec])[:3])[2]
-        target = self.position + max(0.0, self.hover_height - height) * self.calibration.normal
-        self._append(target, "lift", True)
+        reference = self.calibration.drawing_pose(np.r_[self.position, self.rotvec])[:3]
+        target = reference + max(0.0, self.hover_height - height) * self.calibration.normal
+        self.planned_rotvec = self.rotvec.copy()
+        self._append(target, "lift", True, self.rotvec)
 
     def step(
         self, dt: float, measured_position: np.ndarray | None = None, measured_pose: np.ndarray | None = None
@@ -422,16 +493,35 @@ class DrawingController:
         while self.queue:
             waypoint = self.queue[0]
             self.phase = waypoint.phase
-            delta = waypoint.position - self.position
+            current = self.calibration.drawing_pose(np.r_[self.position, self.rotvec])[:3]
+            delta = waypoint.position - current
             distance = float(np.linalg.norm(delta))
             speed = self.lift_speed if waypoint.phase in ("lift", "lower") else self.speed
-            if distance > speed * remaining + 1e-12:
-                self.position += delta * (speed * remaining / distance)
+            rotation = Rotation.from_rotvec(self.rotvec)
+            goal = Rotation.from_rotvec(waypoint.rotvec)
+            turn = (goal * rotation.inv()).as_rotvec()
+            angle = float(np.linalg.norm(turn))
+            offset = np.asarray(self.calibration.tip_offset_m if self.calibration.tip_offset_m is not None else [0, 0, 0])
+            if self.realtime:
+                duration = max(0.0, -float(delta @ self.calibration.normal)) / self.lift_speed
+                fraction = min(1.0, remaining / max(duration, 1e-15), np.deg2rad(5) / max(angle, 1e-15))
+            else:
+                duration = max((distance + np.linalg.norm(offset) * angle) / speed, angle / self.tilt_speed)
+                fraction = min(1.0, remaining / max(duration, 1e-15))
+            updated = Rotation.from_rotvec(turn * fraction) * rotation
+            reference = current + delta * fraction
+            self.position = reference + Rotation.from_rotvec(self.calibration.rotvec).apply(offset) - updated.apply(offset)
+            self.rotvec = np.asarray(waypoint.rotvec).copy() if fraction == 1.0 else updated.as_rotvec()
+            if fraction < 1.0:
                 break
-            self.position = waypoint.position.copy()
-            remaining = max(0.0, remaining - distance / speed)
+            remaining = max(0.0, remaining - duration)
             if waypoint.gate and measured_position is not None:
-                if np.linalg.norm(measured_position - waypoint.position) > self.arrival_tolerance:
+                orientation_error = (
+                    0.0 if measured_pose is None else (Rotation.from_rotvec(measured_pose[3:]).inv() * goal).magnitude()
+                )
+                if np.linalg.norm(measured_position - self.position) > self.arrival_tolerance or orientation_error > np.deg2rad(
+                    0.5
+                ):
                     break
             self.queue.popleft()
             # Give the backend a complete cycle at every contact transition.

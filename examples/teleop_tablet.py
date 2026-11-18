@@ -77,7 +77,8 @@ def check_tablet(args):
                     print(
                         f"u={sample.u:.3f} v={sample.v:.3f} pressure={sample.pressure:.3f} "
                         f"contact={int(sample.touching)} proximity={int(sample.proximity)} "
-                        f"button1={int(sample.button1)} button2={int(sample.button2)}",
+                        f"button1={int(sample.button1)} button2={int(sample.button2)} "
+                        f"tilt={sample.tilt_x_deg}/{sample.tilt_y_deg} deg",
                         flush=True,
                     )
                     last_print = now
@@ -187,7 +188,7 @@ def calibrate(args):
         else:
             print(
                 f"TCP-to-tip offset: {offset_mm} mm in the reported TCP frame. Wrist orientation may change.\n"
-                "Choose the desired drawing orientation at the LAST contact; drawing will keep that orientation."
+                "The LAST contact defines the reference wrist orientation; tilt following adjusts the pen lean from it."
             )
             if repeats > 1:
                 print(
@@ -291,7 +292,7 @@ class SvgPreview:
         self.drawing = False
 
     def add_pose(self, pose: np.ndarray, phase: str):
-        u, v, height = self.calibration.coordinates(pose[:3])
+        u, v, height = self.calibration.coordinates(self.calibration.drawing_pose(pose)[:3])
         contact = abs(height) < 1e-8 and phase in ("lower", "draw")
         if contact:
             if not self.drawing:
@@ -336,9 +337,15 @@ def make_controller(args, calibration: PaperCalibration, pose: np.ndarray) -> Dr
         pose,
         clearance=args.clearance_mm * 0.001,
         speed=args.speed_mm_s * 0.001,
-        lift_speed=args.lift_speed_mm_s * 0.001,
+        lift_speed=(args.lift_speed_mm_s if args.lift_speed_mm_s is not None else 2.0) * 0.001,
         max_queue=args.max_queue,
         draw_height=getattr(args, "air_gap_mm", 0.0) * 0.001,
+        follow_tilt=bool(getattr(args, "follow_tilt", False)),
+        realtime=bool(getattr(args, "realtime", False)),
+        tilt_limit_deg=getattr(args, "tilt_limit_deg", 60.0),
+        tilt_speed=np.deg2rad(getattr(args, "tilt_speed_deg_s", 30.0)),
+        pen_axis_tcp=getattr(args, "pen_axis_tcp", (0.0, 0.0, -1.0)),
+        tilt_signs=getattr(args, "tilt_signs", (1.0, 1.0)),
     )
 
 
@@ -404,20 +411,24 @@ class RunMonitor:
             self.last_progress_time = now
         position_error = np.linalg.norm(measured[:3] - controller.position)
         angle_error = (Rotation.from_rotvec(measured[3:]).inv() * Rotation.from_rotvec(controller.rotvec)).magnitude()
-        pending = controller.aligning or (bool(controller.queue) and position_error > controller.arrival_tolerance)
+        pending = controller.aligning or position_error > controller.arrival_tolerance or angle_error > np.deg2rad(0.5)
         if not pending:
             self.last_progress_time = now
         if now - self.last_print >= 1:
             _, _, height = controller.calibration.coordinates(controller.calibration.drawing_pose(measured)[:3])
-            remaining = (
-                Rotation.from_rotvec(measured[3:]).inv() * Rotation.from_rotvec(controller.calibration.rotvec)
-            ).magnitude()
+            target = (
+                controller.calibration.rotvec
+                if controller.aligning
+                else (controller.queue[0].rotvec if controller.queue else controller.rotvec)
+            )
+            remaining = (Rotation.from_rotvec(measured[3:]).inv() * Rotation.from_rotvec(target)).magnitude()
             moved = np.linalg.norm(measured[:3] - self.initial[:3]) * 1000
+            phase = controller.phase if controller.aligning or controller.queue else ("tracking" if pending else "ready")
             print(
-                f"phase={controller.phase}; TCP moved={moved:.2f} mm; tip height={height * 1000:+.2f} mm; "
+                f"phase={phase}; TCP moved={moved:.2f} mm; tip height={height * 1000:+.2f} mm; "
                 f"wrist remaining={np.rad2deg(remaining):.2f} deg; "
                 f"tracking={position_error * 1000:.2f} mm/{np.rad2deg(angle_error):.2f} deg; "
-                f"tablet reports={self.reports}, tip-down={sample.touching}",
+                f"tablet reports={self.reports}, tip-down={sample.touching}, tilt={sample.tilt_x_deg}/{sample.tilt_y_deg} deg",
                 flush=True,
             )
             self.last_print = now
@@ -432,10 +443,10 @@ class RunMonitor:
 def drawing_step(env, controller, dt, target_time, sample):
     """Send and record the exact RIO action, including input provenance."""
     measured = read_pose(env)
-    if np.linalg.norm(measured[:3] - controller.position) > 0.01:
+    if not controller.realtime and np.linalg.norm(measured[:3] - controller.position) > 0.01:
         raise RuntimeError("Robot is more than 10 mm behind the drawing target; stopping.")
     angle = (Rotation.from_rotvec(measured[3:]).inv() * Rotation.from_rotvec(controller.rotvec)).magnitude()
-    if angle > np.deg2rad(5):
+    if not controller.realtime and angle > np.deg2rad(5):
         raise RuntimeError("Robot orientation is more than 5 degrees behind the target; stopping.")
     pose = controller.step(dt, measured_pose=measured)
     # No gripper client is created by Lite6TabletStation; its placeholder action stays fixed.
@@ -448,6 +459,8 @@ def drawing_step(env, controller, dt, target_time, sample):
         "drawing_queue": len(controller.queue),
         "drawing_target_time": target_time,
         "drawing_air_gap_m": controller.draw_height,
+        "drawing_follow_tilt": controller.follow_tilt,
+        "drawing_realtime": controller.realtime,
     }
     if env.recorder:
         env.recorder.record_step(step)
@@ -462,9 +475,6 @@ def run(args):
     from rio.envs.env import make_env
 
     calibration = PaperCalibration.load(args.calibration)
-    # Validate drawing settings and input permissions before constructing any robot nodes.
-    preview_pose = np.concatenate((np.asarray(calibration.origin), calibration.rotvec))
-    make_controller(args, calibration, preview_pose)
     station = Lite6TabletStation()
     if args.station:
         from examples import cfg
@@ -472,6 +482,17 @@ def run(args):
         if args.station not in cfg.__all__:
             raise ValueError(f"Unknown station: {args.station}")
         station = getattr(cfg, args.station)()
+    if getattr(args, "follow_tilt", None) is None:
+        args.follow_tilt = getattr(station, "follow_pen_tilt", True)
+    if getattr(args, "realtime", None) is None:
+        args.realtime = getattr(station, "realtime", True)
+    if args.lift_speed_mm_s is None:
+        args.lift_speed_mm_s = getattr(station, "down_speed_mm_s", 2.0)
+    for name in ("tilt_limit_deg", "tilt_speed_deg_s", "pen_axis_tcp", "tilt_signs"):
+        if hasattr(station, name):
+            setattr(args, name, getattr(station, name))
+    preview_pose = np.concatenate((np.asarray(calibration.origin), calibration.rotvec))
+    make_controller(args, calibration, preview_pose)
     if station.action_space.lower() != "task_pos" or station.embodiment_type.upper() != "SINGLE_ARM":
         raise ValueError("Tablet drawing requires a SINGLE_ARM station with task_pos actions.")
     if station.arm != "XarmArm" or station.arm_cfg.cfg.get("robot_model", "").lower() != "lite6":
@@ -486,12 +507,16 @@ def run(args):
         raise ValueError("Disable the station's teleop node; this entry point reads the tablet directly.")
     if args.robot_ip:
         station.arm_cfg.cfg["robot_ip"] = args.robot_ip
-    station.arm_cfg.cfg["max_pos_speed"] = max(args.speed_mm_s, args.lift_speed_mm_s) * 0.001
+    station.arm_cfg.cfg["max_pos_speed"] = float("inf") if args.realtime else max(args.speed_mm_s, args.lift_speed_mm_s) * 0.001
+    if args.realtime:
+        station.arm_cfg.cfg["max_rot_speed"] = float("inf")
     if args.no_record:
         station.recorder = None
     if args.record_path:
         station.recorder_cfg.path = args.record_path
     with LinuxTablet(select_device(args.device)) as tablet:
+        if args.follow_tilt and not getattr(tablet, "tilt_supported", False):
+            raise ValueError("Selected pen node does not expose both tilt axes. Use --no-follow-tilt for fixed-angle drawing.")
         mp.set_start_method(station.mp_method, force=True)
         servers, _, env = make_env(station)
         with ServerManager(station.mw, [server for server in servers.values() if server is not None]), env:
@@ -501,6 +526,10 @@ def run(args):
                 print("Startup will lift the pen clear, then slowly align the wrist with TCP-to-tip compensation.")
             if args.air_gap_mm:
                 print(f"Air test: drawing targets are {args.air_gap_mm:g} mm above the taught paper plane.")
+            print(
+                f"Tilt following={args.follow_tilt}; real-time targets={args.realtime}; "
+                f"downward approach={args.lift_speed_mm_s:g} mm/s."
+            )
             input("Lift the stylus off the tablet. Press Enter to begin drawing (Ctrl+C retracts and saves): ")
             tablet.poll()  # Discard all pre-session input; never replay old contact events.
             if tablet.events.touching:
@@ -537,7 +566,8 @@ def run(args):
                     if not controller.aligning and not tablet.events.touching:
                         input_ready = True
                     was_aligning = controller.aligning
-                    drawing_step(env, controller, dt, time.now() + 2 * dt + station.arm_latency, sample)
+                    lead = dt if args.realtime else 2 * dt
+                    drawing_step(env, controller, dt, time.now() + lead + station.arm_latency, sample)
                     monitor.update(controller, read_pose(env), sample, len(reports), time.now())
                     if was_aligning and not controller.aligning:
                         print("Wrist aligned. Lift the stylus, then begin drawing.")
@@ -597,8 +627,25 @@ def main():
         child.add_argument("--freq", type=int, default=50)
         child.add_argument("--clearance-mm", type=float, default=5.0)
         child.add_argument("--speed-mm-s", type=float, default=20.0)
-        child.add_argument("--lift-speed-mm-s", type=float, default=5.0)
+        child.add_argument(
+            "--lift-speed-mm-s",
+            type=float,
+            default=None,
+            help="Downward approach speed in live mode; lift/lower speed otherwise. Defaults to station down_speed_mm_s.",
+        )
         child.add_argument("--max-queue", type=int, default=10000)
+        child.add_argument(
+            "--follow-tilt",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Copy pen lean; run defaults to follow_pen_tilt in the station file.",
+        )
+        child.add_argument(
+            "--realtime",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Use live lateral/upward/tilt targets; downward approach remains limited.",
+        )
         if command == "preview":
             child.add_argument("--output", default="tablet_preview.svg")
             child.add_argument("--demo", action="store_true", help="Use synthetic strokes; needs neither tablet nor robot.")

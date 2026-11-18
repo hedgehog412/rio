@@ -1,7 +1,7 @@
 # Huion tablet drawing on UFACTORY Lite 6
 
-`examples.teleop_tablet` uses absolute Linux stylus input to control a fixed-orientation
-pen in a calibrated paper plane. It runs through RIO's `XarmArm`/`task_pos` driver and
+`examples.teleop_tablet` maps Linux stylus position and tilt onto a calibrated paper
+plane. It runs through RIO's `XarmArm`/`task_pos` driver and
 recorder. It does not require a leader arm, desktop mouse mapping, or an additional
 Python dependency. Stylus pressure is recorded but does not command downward motion.
 
@@ -118,7 +118,8 @@ uv run -m examples.teleop_tablet calibrate \
 In this mode the wrist may rotate freely between contact points. The code
 computes each tip position as `p_tip = p_tcp + R_tcp @ offset`, then converts the
 three contacts into drawing targets at the **last taught orientation**. Choose the
-desired drawing angle at the final contact; that angle stays fixed during drawing.
+reference drawing angle at the final contact. Fixed-angle mode keeps it; tilt mode
+uses it to derive wrist rotation around the mapped pen-body direction.
 The offset is saved in `paper.json` as `tip_offset_m` for provenance. The program does
 not change Studio's TCP configuration. Do not apply a flange-to-tip offset again if
 Studio has already applied it to the reported TCP.
@@ -253,10 +254,9 @@ This example uses the follower IP in `Lite6LeaderFollowerStation` and the user's
 verified pen node; adjust the IP if your robot configuration differs. The calibrated
 paper plane stays unchanged. Stylus contact now traces 10 mm above it; pen-up travel
 is another 5 mm higher. If the wrist needs alignment, the arm first lifts at its current
-angle to at least 20 mm above the paper, then rotates at up to 3 degrees/s while
-compensating the TCP to hold the elevated tip fixed. The clearance increases if
-needed to keep the straight TCP-to-tip segment above the plane. TCP translation is
-also bounded by the configured movement speeds. Each transition waits for measured
+angle to at least 20 mm above the paper, then rotates while compensating the TCP
+to hold the elevated tip fixed. The clearance increases if needed to keep the
+straight TCP-to-tip segment above the plane. Each transition waits for measured
 position/orientation arrival. This is not obstacle or whole-arm collision planning.
 Tablet events during alignment are discarded; lift the stylus before starting a stroke.
 The aligned arm then moves to the selected travel height. Move the stylus slowly
@@ -268,9 +268,9 @@ desktop applications no longer receive events from that node. Keyboard and separ
 mouse devices remain usable. Close `evtest --grab` or another exclusive reader first.
 
 Once per second, the terminal prints the motion phase, measured TCP displacement,
-tip height, wrist angle remaining, tracking error, and tablet report count/contact.
-At 2 mm/s with a 184 mm tip offset, the angular rate is bounded to about 0.62 degrees/s
-and can take a minute or more for a large starting angle. Watch the remaining angle
+tip height, wrist angle remaining, tracking error, tablet report count/contact, and
+raw tilt angles. `phase=ready` means the arm is waiting for stylus input.
+Watch the remaining angle
 decrease during `align`; tablet strokes are ignored until alignment finishes.
 If a pending move makes no measured position or orientation progress for three
 seconds, the run stops and attempts its normal cleanup. A dead RIO arm command
@@ -304,17 +304,49 @@ retracts along the paper normal, then follows the tablet:
 - Ctrl+C, device disconnect, event loss, or queue overflow: discard unfinished strokes,
   attempt a vertical retract from measured position, then save the recording.
 
-Clearance defaults to 5 mm, drawing/travel speed to 20 mm/s, and lift/lower speed to
-5 mm/s. Override with `--clearance-mm`, `--speed-mm-s`, and `--lift-speed-mm-s`.
-These are position-path speed limits, not contact-force or acceleration control.
+Clearance defaults to 5 mm. The station now enables live targets and tilt following
+by default. Edit these values in `examples/cfg/lite6_tablet.py`:
+
+```python
+realtime: bool = True
+follow_pen_tilt: bool = True
+down_speed_mm_s: float = 2.0
+tilt_limit_deg: float = 60.0
+pen_axis_tcp: tuple[float, float, float] = (0.0, 0.0, -1.0)
+tilt_signs: tuple[float, float] = (1.0, 1.0)
+```
+
+In live mode there is no configured lateral/upward/rotational speed cap. The driver
+interpolates live targets and the robot's physical limits still apply; actual motion
+cannot be guaranteed to match arbitrary hand motion. Only the tip's motion toward
+the sheet is limited by `down_speed_mm_s`, or `--lift-speed-mm-s` for one run.
+`--speed-mm-s` applies only with `--no-realtime`. Downward approach can still delay
+the start of a stroke. Orientation changes are subdivided into at most 5 degrees
+per control update for continuous TCP compensation; at 50 Hz this permits up to
+250 degrees/s before the robot's limits. Transitions still wait for measured arrival.
+
+Linux `ABS_TILT_X/Y` are read as signed degrees and included in recordings. Positive
+X/Y lean maps toward paper +U/+V. The two signs can invert either direction. The
+body axis points from tip toward pen body in the reported TCP frame; `-Z` matches
+the measured +Z TCP-to-tip offset. Zero tilt points that body axis along the paper
+normal. Tilting rotates the wrist while recomputing TCP XYZ to hold the physical
+tip at its mapped point and selected air gap. Total lean is limited to the configured
+angle. Barrel twist is derived from the taught orientation; it is not measured.
+No paper recalibration is required when the saved tip offset and mounting are unchanged.
+
+Use `--no-follow-tilt` for fixed-angle drawing, or `--no-realtime` to restore capped
+queued playback. In capped mode `--speed-mm-s` limits travel/drawing (default 20 mm/s),
+`--lift-speed-mm-s` limits lift/lower, and `tilt_speed_deg_s` limits rotation.
 The rigid mount uses the exact taught contact plane; the software does not intentionally
 push below it and cannot compensate for paper movement or measure contact force.
 
-Every stylus report is queued, including fast tip-up/down transitions. If your hand
-moves faster than the arm, the arm finishes those strokes in order. `--max-queue`
-defaults to 10000; reaching it stops rather than silently dropping strokes. Transitions
-wait for measured TCP arrival within 0.5 mm, and a tracking error over 10 mm stops the
-session. No default gripper or startup homing motion is configured.
+Live mode replaces superseded continuous drawing targets with the newest sample;
+pen-up/down boundaries remain ordered so separate strokes are not joined. Capped
+mode queues every report. `--max-queue` defaults to 10000; exhausting the transition
+queue stops the session. Arrival gates require position within 0.5 mm and orientation
+within 0.5 degrees. The 10 mm/5 degree lag guards apply only to capped playback;
+live mode expects tracking lag and retains fresh-feedback, worker-health and
+no-progress checks. No default gripper or startup homing motion is configured.
 
 The recorder saves normal RIO robot states/actions and camera observations. Each step
 also contains `meta/tablet/*`, drawing phase, queue length, and target time. A companion

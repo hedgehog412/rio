@@ -22,6 +22,8 @@ from examples.teleop_tablet import SvgPreview, calibrate, check_tablet, drawing_
 from rio.control.tablet import DrawingController, PaperCalibration, TabletSample
 from rio.control.tablet_input import (
     ABS_PRESSURE,
+    ABS_TILT_X,
+    ABS_TILT_Y,
     ABS_X,
     ABS_Y,
     BTN_STYLUS,
@@ -40,6 +42,103 @@ from rio.control.tablet_input import (
 from rio.embodiments.single_arm import SingleArm
 
 pytestmark = pytest.mark.unit
+
+
+def test_decoder_preserves_tilt_only_and_partial_axis_reports():
+    decoder = TabletEvents((0, 100), (0, 100), tilt_supported=True)
+    first = decoder.feed(packet((EV_ABS, ABS_TILT_X, -23), (EV_ABS, ABS_TILT_Y, 31)))[0]
+    assert (first.tilt_x_deg, first.tilt_y_deg) == (-23, 31)
+    second = decoder.feed(packet((EV_ABS, ABS_TILT_Y, -12)))[0]
+    assert (second.tilt_x_deg, second.tilt_y_deg) == (-23, -12)
+    assert TabletEvents((0, 100), (0, 100)).feed(packet())[0].tilt_x_deg is None
+
+
+@pytest.mark.parametrize("angles", [(0, 0), (25, 0), (0, -30), (20, -15)])
+def test_tilt_maps_pen_body_axis_to_paper_uv(paper, angles):
+    sample = TabletSample(0.5, 0.5, True, tilt_x_deg=angles[0], tilt_y_deg=angles[1])
+    rotation = paper.tilt_rotation(sample, [0, 0, -1], np.array([1, 1]), 60)
+    u = paper.axes[:, 0] / np.linalg.norm(paper.axes[:, 0])
+    v = paper.axes[:, 1] / np.linalg.norm(paper.axes[:, 1])
+    expected = paper.normal + np.tan(np.deg2rad(angles[0])) * u + np.tan(np.deg2rad(angles[1])) * v
+    expected /= np.linalg.norm(expected)
+    np.testing.assert_allclose(Rotation.from_rotvec(rotation).apply([0, 0, -1]), expected, atol=1e-12)
+
+
+def test_live_tilt_keeps_tip_fixed_and_limits_only_downward_approach(paper):
+    paper.tip_offset_m = [0, 0, 0.184]
+    controller = DrawingController(
+        paper, np.r_[paper.origin, paper.rotvec], follow_tilt=True, realtime=True, draw_height=0.01, lift_speed=0.002
+    )
+    sample = TabletSample(0.25, 0.75, True, tilt_x_deg=30, tilt_y_deg=-20)
+    controller.add_sample(sample)
+    commands, phases = drain(controller)
+    coordinates = np.array([paper.coordinates(paper.drawing_pose(pose)[:3]) for pose in commands])
+    assert coordinates[0, 2] == pytest.approx(0.015)  # Upward lift is not capped at 2 mm/s.
+    assert np.diff(coordinates[:, 2]).min() >= -0.002 * 0.02 - 1e-12
+    np.testing.assert_allclose(coordinates[-1], [0.25, 0.75, 0.01], atol=1e-10)
+    assert "lower" in phases
+    controller.add_sample(TabletSample(0.25, 0.75, True, tilt_x_deg=-35, tilt_y_deg=15))
+    tilted, _ = drain(controller)
+    for pose in tilted:
+        np.testing.assert_allclose(paper.coordinates(paper.drawing_pose(pose)[:3]), [0.25, 0.75, 0.01], atol=1e-10)
+    body = Rotation.from_rotvec(tilted[-1, 3:]).apply(controller.pen_axis_tcp)
+    assert np.dot(body, paper.normal) > np.cos(np.deg2rad(60))
+    controller.retract(tilted[-1])
+    lifted, _ = drain(controller)
+    np.testing.assert_allclose(lifted[-1, 3:], tilted[-1, 3:], atol=1e-12)
+    np.testing.assert_allclose(paper.coordinates(paper.drawing_pose(lifted[-1])[:3]), [0.25, 0.75, 0.015], atol=1e-10)
+
+
+def test_realtime_continuous_targets_coalesce_without_removing_lifts(paper):
+    controller = DrawingController(paper, start_pose(paper), realtime=True, max_queue=4)
+    for i in range(1000):
+        controller.add_sample(TabletSample(0.2 + i * 0.0005, 0.2, True))
+    assert len(controller.queue) == 4
+    drain(controller)
+    controller.add_sample(TabletSample(0.9, 0.9, False))
+    assert controller.queue[0].phase == "lift"
+    np.testing.assert_allclose(paper.coordinates(controller.queue[0].position)[:2], [0.6995, 0.2], atol=1e-10)
+
+
+def test_tilt_requires_known_offset_and_valid_axes(paper):
+    with pytest.raises(ValueError, match="known tip_offset"):
+        DrawingController(paper, start_pose(paper), follow_tilt=True)
+    paper.tip_offset_m = [0, 0, 0.184]
+    controller = DrawingController(paper, start_pose(paper), follow_tilt=True)
+    with pytest.raises(ValueError, match="ABS_TILT_X"):
+        controller.add_sample(TabletSample(0.5, 0.5, True))
+
+
+def test_run_defaults_enable_live_tilt_and_remove_driver_speed_caps(paper, tmp_path, monkeypatch):
+    paper.tip_offset_m = [0, 0, 0.184]
+    paper.save(tmp_path / "paper.json")
+    tablet = SimpleNamespace(tilt_supported=True)
+    monkeypatch.setattr(entrypoint, "LinuxTablet", lambda _: nullcontext(tablet))
+    captured = []
+
+    def capture(station):
+        captured.append(station)
+        raise RuntimeError("configuration inspected without starting hardware")
+
+    monkeypatch.setattr(rio.envs.env, "make_env", capture)
+    args = argparse.Namespace(
+        calibration=tmp_path / "paper.json",
+        station=None,
+        device="fake",
+        robot_ip="fake",
+        air_gap_mm=10,
+        clearance_mm=5,
+        speed_mm_s=5,
+        lift_speed_mm_s=None,
+        max_queue=10000,
+        no_record=True,
+        record_path=None,
+    )
+    with pytest.raises(RuntimeError, match="configuration inspected"):
+        run(args)
+    assert args.follow_tilt and args.realtime and args.lift_speed_mm_s == 2.0
+    assert np.isinf(captured[0].arm_cfg.cfg["max_pos_speed"])
+    assert np.isinf(captured[0].arm_cfg.cfg["max_rot_speed"])
 
 
 @pytest.fixture
@@ -648,13 +747,19 @@ def test_tablet_grab_uses_evdev_exclusive_capture(monkeypatch):
     assert calls == [(123, 0x40044590, 1)]
 
 
-def test_real_rio_xarm_request_loop_delivers_alignment_commands(paper, monkeypatch):
+@pytest.mark.parametrize("realtime", [False, True])
+def test_real_rio_xarm_request_loop_delivers_alignment_commands(paper, monkeypatch, realtime):
     pose = tilted_start(paper, (20, 0, 0))
     pose[:3] += 0.06927 * paper.normal
-    controller = DrawingController(paper, pose, speed=0.005, lift_speed=0.002, draw_height=0.01)
+    controller = DrawingController(paper, pose, speed=0.005, lift_speed=0.002, draw_height=0.01, realtime=realtime)
     clock = SimpleNamespace(value=1794968625.0)
     commands = []
-    node = driver.XarmArmClient("Thread", robot_model="lite6", max_pos_speed=0.005, max_rot_speed=0.1)
+    node = driver.XarmArmClient(
+        "Thread",
+        robot_model="lite6",
+        max_pos_speed=float("inf") if realtime else 0.005,
+        max_rot_speed=float("inf") if realtime else 0.1,
+    )
     robot = SingleArm(node, action_space="TASK_POS")
 
     def servo(values, **_):
@@ -1110,6 +1215,8 @@ def test_run_retracts_and_saves_after_interrupt_or_disconnect(paper, tmp_path, m
         lift_speed_mm_s=5,
         max_queue=10000,
         air_gap_mm=air_gap_mm,
+        follow_tilt=False,
+        realtime=False,
     )
     if failure is ConnectionError:
         with pytest.raises(ConnectionError):
