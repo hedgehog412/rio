@@ -325,8 +325,51 @@ def test_start_orientation_and_workspace_are_checked(paper):
         paper.validate_start(np.r_[pose[:3], [0, 0, 0]], 0.005)
     with pytest.raises(ValueError, match="rectangle"):
         paper.validate_start(pose + np.r_[0.5, 0, 0, 0, 0, 0], 0.005)
-    with pytest.raises(ValueError, match="rectangle"):
+    with pytest.raises(ValueError, match="paper plane"):
         paper.validate_start(np.r_[pose[:3] - 0.01 * paper.normal, paper.rotvec], 0.005)
+
+
+@pytest.mark.parametrize("height", [0.1, 0.2])
+@pytest.mark.parametrize("misaligned", [False, True])
+def test_startup_accepts_tip_high_above_rectangle_with_bounded_first_move(paper, height, misaligned):
+    pose = tilted_start(paper) if misaligned else np.r_[paper.map_sample(TabletSample(0.5, 0.5, False)), paper.rotvec]
+    pose[:3] += height * paper.normal
+    controller = DrawingController(paper, pose, lift_speed=0.002, draw_height=0.01)
+    commanded = controller.step(0.02, measured_pose=pose)
+    assert np.linalg.norm(commanded[:3] - pose[:3]) <= 0.002 * 0.02 + 1e-12
+    np.testing.assert_allclose(commanded[3:], pose[3:], atol=1e-12)
+
+
+@pytest.mark.parametrize("position", ["valid", "outside", "below"])
+def test_inspect_start_only_reads_pose_and_reports_paper_coordinates(paper, tmp_path, monkeypatch, capsys, position):
+    pose = tilted_start(paper)
+    if position == "outside":
+        pose[:3] += paper.axes[:, 0]
+    elif position == "below":
+        pose[:3] -= 0.01 * paper.normal
+    paper.save(tmp_path / "paper.json")
+    sdk_pose = pose.copy()
+    sdk_pose[:3] *= 1000
+    calls = []
+
+    def read(**_):
+        calls.append("read")
+        return 0, sdk_pose.tolist()
+
+    arm = SimpleNamespace(
+        connect=lambda: calls.append("connect"), disconnect=lambda: calls.append("disconnect"), get_position_aa=read
+    )
+    monkeypatch.setattr(xarm.wrapper, "XArmAPI", lambda *_, **__: arm)
+    args = argparse.Namespace(robot_ip="fake", calibration=tmp_path / "paper.json", air_gap_mm=10, clearance_mm=5)
+    if position == "valid":
+        entrypoint.inspect_start(args)
+        assert "PASS" in capsys.readouterr().out
+    else:
+        match = "U=1.500, V=0.500" if position == "outside" else "height above paper=-10.00 mm"
+        with pytest.raises(ValueError, match=match):
+            entrypoint.inspect_start(args)
+        assert "Computed physical tip XYZ" in capsys.readouterr().out
+    assert calls == ["connect", "read", "disconnect"]
 
 
 def test_decoder_uses_complete_frames_and_device_ranges():

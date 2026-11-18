@@ -100,8 +100,18 @@ class PaperCalibration:
         start_tolerance = 0.0005
         if self.surface_fit is not None:
             start_tolerance = max(start_tolerance, self.surface_fit.get("max_abs_residual_mm", 0.0) * 0.001 + 0.0001)
-        if not (-0.01 <= u <= 1.01 and -0.01 <= v <= 1.01 and -start_tolerance <= h <= clearance + 0.05):
-            raise ValueError("Start TCP must be over the calibrated rectangle, on or above its contact plane.")
+        details = f"U={u:.3f}, V={v:.3f}; height above paper={h * 1000:+.2f} mm"
+        if not (-0.01 <= u <= 1.01 and -0.01 <= v <= 1.01):
+            raise ValueError(
+                f"Starting tip is outside the calibrated drawing rectangle: {details}. "
+                "Move the physical tip over the taught area (U/V from 0 to 1), then retry."
+            )
+        if h < -start_tolerance:
+            raise ValueError(
+                f"Starting tip is below the calibrated paper plane: {details}; "
+                f"permitted contact discrepancy={start_tolerance * 1000:.2f} mm. "
+                "Lift the tip clear. If this disagrees with the real paper, check the saved tip offset and TCP configuration."
+            )
 
     def drawing_pose(self, pose: np.ndarray) -> np.ndarray:
         """Express the current tip location as a TCP at the drawing orientation."""

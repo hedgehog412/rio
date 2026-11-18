@@ -99,6 +99,37 @@ def _sdk_ok(code, operation: str):
         raise RuntimeError(f"{operation} failed (SDK code {code}).")
 
 
+def inspect_start(args):
+    """Read calibration and robot pose without enabling motors or changing modes."""
+    from xarm.wrapper import XArmAPI
+
+    calibration = PaperCalibration.load(args.calibration)
+    arm = XArmAPI(args.robot_ip, is_radian=True, do_not_open=True)
+    try:
+        arm.connect()
+        code, values = arm.get_position_aa(is_radian=True)
+        _sdk_ok(code, "Reading robot TCP pose")
+        pose = np.asarray(values, dtype=float)
+        if pose.shape != (6,) or not np.isfinite(pose).all():
+            raise ValueError("Robot returned an invalid TCP pose.")
+        pose[:3] *= 0.001
+    finally:
+        arm.disconnect()
+    reference = calibration.drawing_pose(pose)
+    u, v, height = calibration.coordinates(reference[:3])
+    print(f"Reported TCP XYZ (mm): {(pose[:3] * 1000).round(3).tolist()}")
+    if calibration.tip_offset_m is not None:
+        offset = np.asarray(calibration.tip_offset_m)
+        tip = pose[:3] + Rotation.from_rotvec(pose[3:]).apply(offset)
+        print(f"Saved TCP-to-tip offset (mm): {(offset * 1000).tolist()}")
+        print(f"Computed physical tip XYZ (mm): {(tip * 1000).round(3).tolist()}")
+    else:
+        print("Saved tip offset: unknown; only manually aligned startup is supported.")
+    print(f"Paper coordinates: U={u:.3f}, V={v:.3f} (inside: 0 to 1); height={height * 1000:+.2f} mm")
+    controller = DrawingController(calibration, pose, draw_height=args.air_gap_mm * 0.001, clearance=args.clearance_mm * 0.001)
+    print(f"PASS: startup position accepted; automatic wrist alignment={controller.aligning}. No motion commands sent.")
+
+
 def calibrate(args):
     from xarm.wrapper import XArmAPI
 
@@ -500,6 +531,11 @@ def main():
         help="Override tip_offset_mm in examples/cfg/lite6_tablet.py (mm in the reported TCP frame).",
     )
     teaching.add_argument("--flip-normal", action="store_true", help="Reverse the default normal pointing toward base +Z.")
+    inspecting = subparsers.add_parser("inspect-start", help="Read startup tip position relative to paper; no motion commands.")
+    inspecting.add_argument("--robot-ip", required=True)
+    inspecting.add_argument("--calibration", required=True)
+    inspecting.add_argument("--air-gap-mm", type=float, default=0.0)
+    inspecting.add_argument("--clearance-mm", type=float, default=5.0)
     for command in ("preview", "run"):
         child = subparsers.add_parser(command)
         child.add_argument("--calibration", required=True)
@@ -539,6 +575,8 @@ def main():
             check_tablet(args)
         elif args.command == "calibrate":
             calibrate(args)
+        elif args.command == "inspect-start":
+            inspect_start(args)
         elif args.command == "preview":
             preview(args)
         else:

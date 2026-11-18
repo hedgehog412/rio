@@ -213,6 +213,23 @@ Neither preview mode imports or starts the robot driver.
 
 ## 4. First motion test above the paper
 
+To check the current physical tip position without enabling motors, changing robot
+modes, or sending motion commands, run:
+
+```bash
+uv run -m examples.teleop_tablet inspect-start \
+  --robot-ip 192.168.2.176 --calibration paper.json --air-gap-mm 10
+```
+
+This prints the reported TCP, saved tip offset, computed tip XYZ, normalized paper
+coordinates U/V, and perpendicular height above the paper. U and V must be from 0
+to 1 (with a 1% edge tolerance). A negative height beyond the calibration contact
+tolerance is rejected. There is no upper starting-height limit; the old travel-height
+plus 50 mm ceiling rejected otherwise valid lifted poses. Startup motion remains
+speed-limited. An outside-area tip must be positioned over the taught drawing area
+before running. If calculated height disagrees with the real sheet, check the saved
+offset, unchanged TCP settings, and paper placement before proceeding.
+
 Keep the pen mount and paper fixed after teaching the three contact points. For a
 first trial, an 80 x 50 mm drawing rectangle is a convenient small area with roughly
 the Inspiroy 2 M's aspect ratio. Stop other robot-control scripts and leave the arm
