@@ -172,7 +172,14 @@ file setting and the override are absent, calibration retains the legacy assumpt
 unknown offset and requires orientation to stay within three degrees of the first
 point. With an explicit offset, including zero for a tip TCP, that teaching restriction
 does not apply. Startup still checks the chosen drawing orientation; leave the arm
-at its final teaching pose or align to that same orientation before starting a run.
+above the drawing area at that same orientation before starting a run.
+
+After the final contact, calibration keeps hand guiding enabled and prompts you to
+lift the pen clear of the sheet and reposition it above the drawing area. Keep the
+last contact's wrist orientation for drawing. Press Enter only when ready to hold
+the new position. This repositioning is not another calibration contact and does not
+change the taught plane, corner mapping, or drawing orientation. Existing
+`paper.json` files remain usable; recalibration is not needed for this change.
 
 On completion, Ctrl+C, or an error, calibration stops teaching and returns to mode 0
 to hold the current position before disconnecting. It never restores an earlier servo

@@ -642,6 +642,79 @@ def test_calibration_plane_mode_uses_distinct_surface_contacts(surface_contacts,
     assert calibration.contact_checks is None
 
 
+@pytest.mark.parametrize("outcome", ["finish", "interrupt", "eof", "fault"])
+def test_calibration_waits_for_reposition_without_changing_contacts(surface_contacts, tmp_path, monkeypatch, outcome):
+    offset, poses, _ = surface_contacts
+    samples = iter(poses)
+    state = SimpleNamespace(mode=None, pose=None, held=None, reads=0, fault=False, repositioned=False)
+    calls = []
+
+    def set_mode(mode):
+        state.mode = mode
+        calls.append(("mode", mode))
+        return 0
+
+    def set_state(value):
+        calls.append(("state", value))
+        if state.mode == 0 and value == 0:
+            state.held = state.pose.copy()
+        return 0
+
+    def read_pose(**_):
+        state.pose = next(samples).copy()
+        state.reads += 1
+        sdk_pose = state.pose.copy()
+        sdk_pose[:3] *= 1000
+        return 0, sdk_pose.tolist()
+
+    def prompt(message):
+        if message.startswith("All contacts recorded"):
+            assert state.mode == 2 and state.reads == len(poses)
+            state.repositioned = True
+            state.pose = state.pose + np.array([0.01, -0.01, 0.02, 0, 0, 0])
+            if outcome == "interrupt":
+                raise KeyboardInterrupt
+            if outcome == "eof":
+                raise EOFError
+            state.fault = outcome == "fault"
+        return ""
+
+    arm = SimpleNamespace(
+        connect=lambda: None,
+        disconnect=lambda: calls.append("disconnect"),
+        get_err_warn_code=lambda: (0, [37 if state.fault else 0, 0]),
+        get_is_moving=lambda: False,
+        motion_enable=lambda _: 0,
+        set_mode=set_mode,
+        set_state=set_state,
+        get_position_aa=read_pose,
+    )
+    monkeypatch.setattr(xarm.wrapper, "XArmAPI", lambda *_, **__: arm)
+    monkeypatch.setattr("builtins.input", prompt)
+    monkeypatch.setattr(
+        "examples.cfg.lite6_tablet.Lite6TabletStation", lambda: SimpleNamespace(tip_offset_mm=(offset * 1000).tolist())
+    )
+    output = tmp_path / "paper.json"
+    output.write_text("previous calibration")
+    args = argparse.Namespace(robot_ip="fake", output=output, flip_normal=False)
+    if outcome == "finish":
+        calibrate(args)
+        taught = PaperCalibration.load(output)
+        expected = PaperCalibration.from_surface_contacts(poses, offset)
+        np.testing.assert_allclose(
+            [taught.origin, taught.corner_u, taught.corner_v, taught.rotvec],
+            [expected.origin, expected.corner_u, expected.corner_v, expected.rotvec],
+        )
+    else:
+        failure = {"interrupt": KeyboardInterrupt, "eof": EOFError, "fault": RuntimeError}[outcome]
+        with pytest.raises(failure):
+            calibrate(args)
+        assert output.read_text() == "previous calibration"
+    assert state.repositioned and state.reads == len(poses)
+    np.testing.assert_allclose(state.held, poses[-1] + [0.01, -0.01, 0.02, 0, 0, 0])
+    assert calls[-4:] == [("state", 4), ("mode", 0), ("state", 0), "disconnect"]
+
+
 @pytest.mark.parametrize("failure", [KeyboardInterrupt, RuntimeError])
 def test_hand_guiding_is_disabled_on_aborted_calibration(tmp_path, monkeypatch, failure):
     calls = []

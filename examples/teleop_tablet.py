@@ -202,6 +202,16 @@ def calibrate(args):
                     tip = pose[:3] + Rotation.from_rotvec(pose[3:]).apply(tip_offset)
                     print(f"Computed tip XYZ (mm): {(tip * 1000).round(3).tolist()}")
             groups.append(group)
+        input(
+            "All contacts recorded; hand guiding is still enabled. Lift the pen clear of the paper and move it "
+            "above the drawing area, keeping the final taught wrist orientation. "
+            "Support the arm, then press Enter to hold this position and finish. "
+            "This repositioning is not recorded as a calibration contact: "
+        )
+        code, errors = arm.get_err_warn_code()
+        _sdk_ok(code, "Checking controller after repositioning")
+        if any(errors):
+            raise RuntimeError(f"Calibration stopped: controller error/warning {errors}. Resolve it in Studio before retrying.")
     finally:
         try:
             if guiding_changed:
