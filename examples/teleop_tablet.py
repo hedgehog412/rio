@@ -204,7 +204,7 @@ def calibrate(args):
             groups.append(group)
         input(
             "All contacts recorded; hand guiding is still enabled. Lift the pen clear of the paper and move it "
-            "above the drawing area, keeping the final taught wrist orientation. "
+            "above the drawing area. With a known tip offset, startup can restore the final taught wrist orientation. "
             "Support the arm, then press Enter to hold this position and finish. "
             "This repositioning is not recorded as a calibration contact: "
         )
@@ -353,7 +353,10 @@ def drawing_step(env, controller, dt, target_time, sample):
     measured = read_pose(env)
     if np.linalg.norm(measured[:3] - controller.position) > 0.01:
         raise RuntimeError("Robot is more than 10 mm behind the drawing target; stopping.")
-    pose = controller.step(dt, measured_position=measured[:3])
+    angle = (Rotation.from_rotvec(measured[3:]).inv() * Rotation.from_rotvec(controller.rotvec)).magnitude()
+    if angle > np.deg2rad(5):
+        raise RuntimeError("Robot orientation is more than 5 degrees behind the target; stopping.")
+    pose = controller.step(dt, measured_pose=measured)
     # No gripper client is created by Lite6TabletStation; its placeholder action stays fixed.
     action = env.robot.build_action(pose, gripper_cmd=0.0)
     env.move(action, t_cmd_target=target_time)
@@ -413,6 +416,8 @@ def run(args):
         with ServerManager(station.mw, [server for server in servers.values() if server is not None]), env:
             measured = read_pose(env)
             controller = make_controller(args, calibration, measured)
+            if controller.aligning:
+                print("Startup will lift the pen clear, then slowly align the wrist with TCP-to-tip compensation.")
             if args.air_gap_mm:
                 print(f"Air test: drawing targets are {args.air_gap_mm:g} mm above the taught paper plane.")
             input("Lift the stylus off the tablet. Press Enter to begin drawing (Ctrl+C retracts and saves): ")
@@ -422,6 +427,7 @@ def run(args):
             if np.linalg.norm(read_pose(env) - measured) > 0.001:
                 raise ValueError("Robot pose changed while waiting to start; restart.")
             controller = make_controller(args, calibration, measured)
+            input_ready = not controller.aligning
             t_start = time.now()
             env.set_start_time(t_start)
             env.set_instruction(station.instruction)
@@ -437,11 +443,19 @@ def run(args):
             try:
                 while True:
                     tick_start = time.now()
-                    for sample in tablet.poll():
+                    reports = tablet.poll()
+                    accept_input = input_ready and not controller.aligning
+                    for sample in reports:
                         if trace:
                             trace.write(json.dumps({"received_at": time.now() - t_start, **asdict(sample)}) + "\n")
-                        controller.add_sample(sample)
+                        if accept_input:
+                            controller.add_sample(sample)
+                    if not controller.aligning and not tablet.events.touching:
+                        input_ready = True
+                    was_aligning = controller.aligning
                     drawing_step(env, controller, dt, time.now() + 2 * dt + station.arm_latency, sample)
+                    if was_aligning and not controller.aligning:
+                        print("Wrist aligned. Lift the stylus, then begin drawing.")
                     time.precise_wait(tick_start + dt)
             except KeyboardInterrupt:
                 logger.info("Drawing stopped; retracting.")

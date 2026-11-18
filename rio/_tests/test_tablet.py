@@ -49,6 +49,78 @@ def start_pose(paper):
     return np.r_[np.asarray(paper.origin) + 0.005 * paper.normal, paper.rotvec]
 
 
+def tilted_start(paper, tilt=(40, -30, 60)):
+    paper.tip_offset_m = [0, 0, 0.184]
+    rotation = Rotation.from_euler("xyz", tilt, degrees=True) * Rotation.from_rotvec(paper.rotvec)
+    equivalent = paper.map_sample(TabletSample(0.5, 0.5, False))
+    tip = equivalent + Rotation.from_rotvec(paper.rotvec).apply(paper.tip_offset_m)
+    return np.r_[tip - rotation.apply(paper.tip_offset_m), rotation.as_rotvec()]
+
+
+@pytest.mark.parametrize("tilt", [(40, -30, 60), (0, 180, 0), (0, 0, 179)])
+def test_startup_lifts_then_aligns_about_tip_with_bounded_speeds(paper, tilt):
+    pose = tilted_start(paper, tilt)
+    controller = DrawingController(paper, pose, lift_speed=0.005)
+    initial = pose.copy()
+    aligned_tips = []
+    for _ in range(15000):
+        if not controller.aligning and not controller.queue:
+            break
+        previous = pose.copy()
+        pose = controller.step(0.02, measured_pose=pose)
+        assert np.linalg.norm(pose[:3] - previous[:3]) <= 0.005 * 0.02 + 1e-12
+        angle = (Rotation.from_rotvec(previous[3:]).inv() * Rotation.from_rotvec(pose[3:])).magnitude()
+        assert angle <= np.deg2rad(3) * 0.02 + 1e-12
+        equivalent = paper.drawing_pose(pose)
+        u, v, height = paper.coordinates(equivalent[:3])
+        np.testing.assert_allclose([u, v], [0.5, 0.5], atol=1e-10)
+        if controller.phase == "startup-lift":
+            np.testing.assert_allclose(pose[3:], initial[3:], atol=1e-12)
+        if controller.phase == "align":
+            assert height >= 0.02 - 1e-10
+            aligned_tips.append(equivalent[:3])
+    else:
+        pytest.fail("Startup did not finish.")
+    assert len(aligned_tips) > 1
+    np.testing.assert_allclose(aligned_tips, np.tile(aligned_tips[0], (len(aligned_tips), 1)), atol=1e-11)
+    np.testing.assert_allclose(pose[3:], paper.rotvec, atol=1e-12)
+    np.testing.assert_allclose(paper.coordinates(pose[:3]), [0.5, 0.5, 0.005], atol=1e-10)
+
+
+def test_startup_waits_for_measured_lift_and_orientation(paper):
+    initial = tilted_start(paper, (0, 0, 10))
+    controller = DrawingController(paper, initial)
+    for _ in range(300):
+        pose = controller.step(0.02, measured_pose=initial)
+    assert controller.aligning and controller.alignment_phase == "startup-lift"
+    np.testing.assert_allclose(pose[3:], initial[3:])
+    elevated = pose.copy()
+    for _ in range(1000):
+        pose = controller.step(0.02, measured_pose=elevated)
+    assert controller.aligning and controller.phase == "align"
+    controller.step(0.02, measured_pose=pose)
+    assert not controller.aligning
+
+
+def test_abort_during_alignment_retracts_without_rotating(paper):
+    pose = tilted_start(paper)
+    controller = DrawingController(paper, pose)
+    while controller.phase != "align":
+        pose = controller.step(0.02, measured_pose=pose)
+    controller.retract(pose)
+    commands, _ = drain(controller)
+    np.testing.assert_allclose(commands[:, 3:], np.tile(pose[3:], (len(commands), 1)), atol=1e-12)
+    assert not controller.aligning
+    np.testing.assert_allclose(commands[-1, :3], pose[:3], atol=1e-12)
+
+
+def test_startup_rejects_tip_below_plane_at_different_orientation(paper):
+    pose = tilted_start(paper)
+    pose[:3] -= 0.01 * paper.normal
+    with pytest.raises(ValueError, match="plane"):
+        DrawingController(paper, pose)
+
+
 def packet(*events):
     return b"".join(INPUT_EVENT.pack(123, 456, *event) for event in [*events, (EV_SYN, SYN_REPORT, 0)])
 
@@ -837,14 +909,16 @@ def test_input_check_reports_quick_button_edges_and_requires_both(monkeypatch, c
 
 @pytest.mark.parametrize("failure", [KeyboardInterrupt, ConnectionError])
 @pytest.mark.parametrize("air_gap_mm", [0, 10])
-def test_run_retracts_and_saves_after_interrupt_or_disconnect(paper, tmp_path, monkeypatch, failure, air_gap_mm):
+@pytest.mark.parametrize("misaligned", [False, True])
+def test_run_retracts_and_saves_after_interrupt_or_disconnect(paper, tmp_path, monkeypatch, failure, air_gap_mm, misaligned):
+    pose = tilted_start(paper, (0, 0, 5)) if misaligned else start_pose(paper)
     paper.save(tmp_path / "paper.json")
     clock = SimpleNamespace(value=100.0)
     monkeypatch.setattr(rio_hw.time, "now", lambda: clock.value)
     monkeypatch.setattr(rio_hw.time, "precise_wait", lambda target: setattr(clock, "value", max(clock.value, target)))
     monkeypatch.setattr(rio_hw.middleware, "ServerManager", lambda *_: nullcontext())
     monkeypatch.setattr("builtins.input", lambda _: "")
-    env = FakeEnv(start_pose(paper))
+    env = FakeEnv(pose)
     saved = []
     env.recorder.save = lambda **_: saved.append(True)
     monkeypatch.setattr(rio.envs.env, "make_env", lambda _: ({}, {}, env))
@@ -854,9 +928,22 @@ def test_run_retracts_and_saves_after_interrupt_or_disconnect(paper, tmp_path, m
 
         def __init__(self, _):
             self.calls = 0
+            self.events = SimpleNamespace(touching=False)
 
         def poll(self):
             self.calls += 1
+            if misaligned:
+                if self.calls == 2:
+                    self.events.touching = True
+                    return [TabletSample(0.9, 0.9, True)]
+                if self.calls == 100:
+                    self.events.touching = False
+                    return [TabletSample(0.9, 0.9, False)]
+                if self.calls == 600:
+                    return [TabletSample(0.2, 0.2, True)]
+                if self.calls >= 900:
+                    raise failure()
+                return []
             if self.calls == 2:
                 return [TabletSample(0.2, 0.2, True)]
             if self.calls >= 300:
@@ -890,10 +977,15 @@ def test_run_retracts_and_saves_after_interrupt_or_disconnect(paper, tmp_path, m
     else:
         run(args)
     assert saved == [True]
+    if misaligned:
+        assert any(record.meta["drawing_phase"] == "align" for record in env.records)
+        # The 0.9/0.9 stroke received during alignment must never be replayed.
+        coords = [paper.coordinates(paper.drawing_pose(command[:6])[:3]) for command, _ in env.commands]
+        assert np.max(np.asarray(coords)[:, :2]) <= 0.501
     assert any(record.meta["drawing_phase"] == "lower" for record in env.records)
     np.testing.assert_allclose(paper.coordinates(env.pose[:3]), [0.2, 0.2, 0.005 + air_gap_mm * 0.001], atol=1e-9)
     assert env.records[-1].meta["drawing_air_gap_m"] == air_gap_mm * 0.001
     assert env.records[-1].meta["drawing_phase"] == "lift"
     traces = list((tmp_path / "recordings").glob("*_input.jsonl"))
     assert len(traces) == 1
-    assert json.loads(traces[0].read_text())["touching"]
+    assert json.loads(traces[0].read_text().splitlines()[0])["touching"]

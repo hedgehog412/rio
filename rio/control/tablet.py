@@ -103,6 +103,17 @@ class PaperCalibration:
         if not (-0.01 <= u <= 1.01 and -0.01 <= v <= 1.01 and -start_tolerance <= h <= clearance + 0.05):
             raise ValueError("Start TCP must be over the calibrated rectangle, on or above its contact plane.")
 
+    def drawing_pose(self, pose: np.ndarray) -> np.ndarray:
+        """Express the current tip location as a TCP at the drawing orientation."""
+        pose = np.asarray(pose, dtype=float)
+        if pose.shape != (6,) or not np.isfinite(pose).all():
+            raise ValueError("Robot must publish a finite six-element axis-angle TCP pose.")
+        if self.tip_offset_m is None:
+            return pose.copy()  # Legacy files still require manual orientation alignment.
+        offset = np.asarray(self.tip_offset_m)
+        tip = pose[:3] + Rotation.from_rotvec(pose[3:]).apply(offset)
+        return np.r_[tip - Rotation.from_rotvec(self.rotvec).apply(offset), self.rotvec]
+
     def save(self, path: str | Path):
         Path(path).write_text(json.dumps(asdict(self), indent=2) + "\n")
 
@@ -263,17 +274,41 @@ class DrawingController:
         arrival_tolerance: float = 0.0005,
         max_queue: int = 10000,
         draw_height: float = 0.0,
+        alignment_clearance: float = 0.02,
+        alignment_speed: float = np.deg2rad(3),
     ):
-        if not all(np.isfinite(x) and x > 0 for x in (clearance, speed, lift_speed, arrival_tolerance)):
+        if not all(
+            np.isfinite(x) and x > 0
+            for x in (clearance, speed, lift_speed, arrival_tolerance, alignment_clearance, alignment_speed)
+        ):
             raise ValueError("Clearance, speeds, and arrival tolerance must be finite and positive.")
         if max_queue < 4:
             raise ValueError("max_queue must be at least four.")
         if not np.isfinite(draw_height) or draw_height < 0:
             raise ValueError("draw_height must be finite and nonnegative.")
         hover_height = draw_height + clearance
-        calibration.validate_start(np.asarray(start_pose), hover_height)
+        drawing_pose = calibration.drawing_pose(start_pose)
+        calibration.validate_start(drawing_pose, hover_height)
         self.calibration = calibration
         self.position = np.array(start_pose[:3], dtype=float)
+        self.rotvec = np.array(start_pose[3:], dtype=float)
+        angle = (Rotation.from_rotvec(self.rotvec).inv() * Rotation.from_rotvec(calibration.rotvec)).magnitude()
+        self.aligning = calibration.tip_offset_m is not None and angle > 1e-8
+        self.alignment_speed = alignment_speed
+        self.alignment_height = max(alignment_clearance, hover_height, calibration.coordinates(drawing_pose[:3])[2])
+        if self.aligning:
+            # Keep the straight TCP-to-tip segment above the plane during the
+            # entire shortest rotation, including an intermediate upward tilt.
+            rotation = Rotation.from_rotvec(self.rotvec)
+            delta = (Rotation.from_rotvec(calibration.rotvec) * rotation.inv()).as_rotvec()
+            samples = Rotation.from_rotvec(np.linspace(0, 1, 181)[:, None] * delta) * rotation
+            offset = np.asarray(calibration.tip_offset_m, dtype=float)
+            reaches = samples.apply(np.tile(offset, (181, 1))) @ calibration.normal
+            between_samples = np.linalg.norm(offset) * np.linalg.norm(delta) / 360
+            self.alignment_height = max(self.alignment_height, float(reaches.max()) + between_samples + clearance)
+        else:
+            self.rotvec = np.asarray(calibration.rotvec).copy()
+        self.alignment_phase = "startup-lift"
         self.clearance = clearance
         self.draw_height = draw_height
         self.hover_height = hover_height
@@ -284,8 +319,42 @@ class DrawingController:
         self.queue: deque[DrawingController.Waypoint] = deque()
         self.touching = False
         self.phase = "lift"
-        self.planned_surface = self.position - calibration.coordinates(self.position)[2] * calibration.normal
+        self.planned_surface = drawing_pose[:3] - calibration.coordinates(drawing_pose[:3])[2] * calibration.normal
         self._append(self.planned_surface + hover_height * calibration.normal, "lift", True)
+
+    def _alignment_step(self, dt: float, measured_pose: np.ndarray | None) -> np.ndarray:
+        """Lift first, then rotate about the elevated tip with bounded TCP speed."""
+        normal = self.calibration.normal
+        offset = np.asarray(self.calibration.tip_offset_m)
+        rotation = Rotation.from_rotvec(self.rotvec)
+        self.phase = self.alignment_phase
+        if self.alignment_phase == "startup-lift":
+            equivalent = self.calibration.drawing_pose(np.r_[self.position, self.rotvec])
+            height = self.calibration.coordinates(equivalent[:3])[2]
+            self.position += max(0.0, min(self.alignment_height - height, self.lift_speed * dt)) * normal
+            if height + self.lift_speed * dt >= self.alignment_height - 1e-10:
+                if measured_pose is None or np.linalg.norm(measured_pose[:3] - self.position) <= self.arrival_tolerance:
+                    self.alignment_phase = "align"
+        else:
+            goal = Rotation.from_rotvec(self.calibration.rotvec)
+            delta = (goal * rotation.inv()).as_rotvec()
+            angle = np.linalg.norm(delta)
+            # |d TCP| <= |offset| * d angle for a rotation about the tip.
+            max_angle = min(self.alignment_speed, min(self.speed, self.lift_speed) / max(np.linalg.norm(offset), 1e-9)) * dt
+            fraction = min(1.0, max_angle / max(angle, 1e-15))
+            tip = self.position + rotation.apply(offset)
+            updated = Rotation.from_rotvec(delta * fraction) * rotation
+            self.position = tip - updated.apply(offset)
+            self.rotvec = updated.as_rotvec()
+            if fraction == 1.0:
+                arrived = measured_pose is None or (
+                    np.linalg.norm(measured_pose[:3] - self.position) <= self.arrival_tolerance
+                    and (Rotation.from_rotvec(measured_pose[3:]).inv() * goal).magnitude() <= np.deg2rad(0.5)
+                )
+                if arrived:
+                    self.aligning = False
+                    self.rotvec = np.asarray(self.calibration.rotvec).copy()
+        return np.r_[self.position, self.rotvec]
 
     def _append(self, position: np.ndarray, phase: str, gate: bool = False):
         if len(self.queue) >= self.max_queue:
@@ -319,17 +388,26 @@ class DrawingController:
     def retract(self, measured_pose: np.ndarray | None = None):
         """Discard unfinished strokes and retract vertically from measured position."""
         if measured_pose is not None:
-            self.calibration.validate_start(measured_pose, self.hover_height)
+            equivalent = self.calibration.drawing_pose(measured_pose)
+            self.calibration.validate_start(equivalent, max(self.hover_height, self.alignment_height))
             self.position = np.array(measured_pose[:3], dtype=float)
+            self.rotvec = np.array(measured_pose[3:], dtype=float)
+        self.aligning = False
         self.queue.clear()
         self.touching = False
-        height = self.calibration.coordinates(self.position)[2]
+        height = self.calibration.coordinates(self.calibration.drawing_pose(np.r_[self.position, self.rotvec])[:3])[2]
         target = self.position + max(0.0, self.hover_height - height) * self.calibration.normal
         self._append(target, "lift", True)
 
-    def step(self, dt: float, measured_position: np.ndarray | None = None) -> np.ndarray:
+    def step(
+        self, dt: float, measured_position: np.ndarray | None = None, measured_pose: np.ndarray | None = None
+    ) -> np.ndarray:
         if not np.isfinite(dt) or dt <= 0:
             raise ValueError("dt must be finite and positive.")
+        if measured_pose is not None:
+            measured_position = measured_pose[:3]
+        if self.aligning:
+            return self._alignment_step(dt, measured_pose)
         remaining = dt
         while self.queue:
             waypoint = self.queue[0]
@@ -349,4 +427,4 @@ class DrawingController:
             # Give the backend a complete cycle at every contact transition.
             if waypoint.gate or remaining <= 0:
                 break
-        return np.concatenate((self.position, self.calibration.rotvec))
+        return np.concatenate((self.position, self.rotvec))

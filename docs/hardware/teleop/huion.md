@@ -171,12 +171,14 @@ An optional `--tip-offset-mm X Y Z` overrides the file for one invocation. If bo
 file setting and the override are absent, calibration retains the legacy assumption of a constant
 unknown offset and requires orientation to stay within three degrees of the first
 point. With an explicit offset, including zero for a tip TCP, that teaching restriction
-does not apply. Startup still checks the chosen drawing orientation; leave the arm
-above the drawing area at that same orientation before starting a run.
+does not apply. With `tip_offset_m` saved in the calibration, startup automatically
+aligns the wrist. The physical tip must start over the drawing area, on or above
+the paper; its initial wrist angle may differ. Legacy files with no tip offset
+still require manual alignment because rotation compensation cannot be calculated.
 
 After the final contact, calibration keeps hand guiding enabled and prompts you to
 lift the pen clear of the sheet and reposition it above the drawing area. Keep the
-last contact's wrist orientation for drawing. Press Enter only when ready to hold
+last contact's wrist orientation if convenient; startup can align it later. Press Enter only when ready to hold
 the new position. This repositioning is not another calibration contact and does not
 change the taught plane, corner mapping, or drawing orientation. Existing
 `paper.json` files remain usable; recalibration is not needed for this change.
@@ -214,7 +216,8 @@ Neither preview mode imports or starts the robot driver.
 Keep the pen mount and paper fixed after teaching the three contact points. For a
 first trial, an 80 x 50 mm drawing rectangle is a convenient small area with roughly
 the Inspiroy 2 M's aspect ratio. Stop other robot-control scripts and leave the arm
-over that rectangle with the taught pen orientation.
+with the physical tip over that rectangle. Its wrist orientation may differ when
+the calibration contains the known tip offset.
 
 Use an air gap for the first motion test, without recording:
 
@@ -232,8 +235,14 @@ uv run -m examples.teleop_tablet run \
 This example uses the follower IP in `Lite6LeaderFollowerStation` and the user's
 verified pen node; adjust the IP if your robot configuration differs. The calibrated
 paper plane stays unchanged. Stylus contact now traces 10 mm above it; pen-up travel
-is another 5 mm higher. The arm first raises along the paper normal before any lateral
-movement, including when starting at a taught contact point. Move the stylus slowly
+is another 5 mm higher. If the wrist needs alignment, the arm first lifts at its current
+angle to at least 20 mm above the paper, then rotates at up to 3 degrees/s while
+compensating the TCP to hold the elevated tip fixed. The clearance increases if
+needed to keep the straight TCP-to-tip segment above the plane. TCP translation is
+also bounded by the configured movement speeds. Each transition waits for measured
+position/orientation arrival. This is not obstacle or whole-arm collision planning.
+Tablet events during alignment are discarded; lift the stylus before starting a stroke.
+The aligned arm then moves to the selected travel height. Move the stylus slowly
 and test two separate strokes, checking their direction and the lift between them.
 Ctrl+C discards queued strokes and attempts a vertical retract to the travel height.
 
@@ -243,7 +252,8 @@ are also included as `meta/drawing_air_gap_m` in recordings.
 
 ## 5. Run and record
 
-Position the arm above the calibrated rectangle with its taught orientation. Start:
+Position the physical tip above the calibrated rectangle. Startup aligns its wrist
+using the saved tip offset. Start:
 
 ```bash
 uv run -m examples.teleop_tablet run \
