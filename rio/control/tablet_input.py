@@ -116,6 +116,15 @@ class LinuxTablet:
             reports.extend(self.events.feed(data))
         raise RuntimeError("Tablet input flood; stopping drawing.")
 
+    def grab(self):
+        """Route pen events exclusively to this reader until the file is closed."""
+        try:
+            fcntl.ioctl(self.fd, 0x40044590, 1)  # EVIOCGRAB
+        except OSError as exc:
+            raise RuntimeError(
+                "Could not capture the tablet pen. Close evtest or other programs grabbing this input node."
+            ) from exc
+
     def close(self):
         os.close(self.fd)
 

@@ -4,12 +4,14 @@
 import argparse
 import json
 import os
+import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import rio_hw.middleware
+import rio_hw.robots.xarm_arm as driver
 import rio_hw.time
 import xarm.wrapper
 from scipy.spatial.transform import Rotation
@@ -35,6 +37,7 @@ from rio.control.tablet_input import (
     LinuxTablet,
     TabletEvents,
 )
+from rio.embodiments.single_arm import SingleArm
 
 pytestmark = pytest.mark.unit
 
@@ -605,6 +608,97 @@ def test_stale_feedback_stops_before_sending(paper):
     assert not env.commands
 
 
+def test_dead_command_thread_is_rejected_despite_fresh_pose(paper):
+    env = FakeEnv(start_pose(paper))
+
+    class StoppedArm(threading.Thread):
+        def get_state(self):
+            return {"eef_pose": start_pose(paper), "timestamp": rio_hw.time.now()}
+
+    env.robot.arm = StoppedArm()
+    with pytest.raises(RuntimeError, match="command thread has stopped"):
+        entrypoint.read_pose(env)
+
+
+def test_run_monitor_reports_input_and_stops_stalled_alignment(paper, capsys):
+    pose = tilted_start(paper)
+    controller = DrawingController(paper, pose)
+    monitor = entrypoint.RunMonitor(pose, 0)
+    monitor.update(controller, pose, TabletSample(0.5, 0.5, True), 7, 1)
+    assert "tablet reports=7, tip-down=True" in capsys.readouterr().out
+    with pytest.raises(RuntimeError, match="No measured robot progress"):
+        monitor.update(controller, pose, TabletSample(0.5, 0.5, False), 0, 3.1)
+
+
+def test_run_monitor_accepts_rotation_progress_without_translation(paper):
+    pose = tilted_start(paper, (0, 0, 30))
+    controller = DrawingController(paper, pose)
+    monitor = entrypoint.RunMonitor(pose, 0)
+    for i in range(1, 10):
+        pose[3:] = (Rotation.from_rotvec([0, 0, np.deg2rad(0.1)]) * Rotation.from_rotvec(pose[3:])).as_rotvec()
+        monitor.update(controller, pose, TabletSample(0, 0, False), 0, float(i))
+
+
+def test_tablet_grab_uses_evdev_exclusive_capture(monkeypatch):
+    tablet = object.__new__(LinuxTablet)
+    tablet.fd = 123
+    calls = []
+    monkeypatch.setattr("rio.control.tablet_input.fcntl.ioctl", lambda *args: calls.append(args))
+    tablet.grab()
+    assert calls == [(123, 0x40044590, 1)]
+
+
+def test_real_rio_xarm_request_loop_delivers_alignment_commands(paper, monkeypatch):
+    pose = tilted_start(paper, (20, 0, 0))
+    pose[:3] += 0.06927 * paper.normal
+    controller = DrawingController(paper, pose, speed=0.005, lift_speed=0.002, draw_height=0.01)
+    clock = SimpleNamespace(value=1794968625.0)
+    commands = []
+    node = driver.XarmArmClient("Thread", robot_model="lite6", max_pos_speed=0.005, max_rot_speed=0.1)
+    robot = SingleArm(node, action_space="TASK_POS")
+
+    def servo(values, **_):
+        measured = np.asarray(values).copy()
+        measured[:3] *= 0.001
+        commands.append(measured)
+        if len(commands) % 5 == 0:
+            target = controller.step(0.02, measured_pose=measured)
+            robot.move(np.r_[target, 0.0], clock.value + 0.04)
+        if len(commands) >= 1000:
+            node.exit_event.set()
+        return 0
+
+    sdk_pose = pose.copy()
+    sdk_pose[:3] *= 1000
+    sdk = SimpleNamespace(
+        connect=lambda: None,
+        disconnect=lambda: None,
+        clean_error=lambda: None,
+        clean_warn=lambda: None,
+        motion_enable=lambda _: 0,
+        has_err_warn=False,
+        error_code=0,
+        connected=True,
+        set_mode=lambda _: 0,
+        set_state=lambda _: 0,
+        get_position_aa=lambda: (0, sdk_pose.tolist()),
+        set_servo_cartesian_aa=servo,
+        get_servo_angle=lambda: (0, [0.0] * 6),
+        set_servo_angle=lambda **_: 0,
+    )
+    monkeypatch.setattr(driver, "XArmAPI", lambda *_, **__: sdk)
+    monkeypatch.setattr(driver.time, "now", lambda: clock.value)
+    monkeypatch.setattr(driver.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        driver.time, "Rate", lambda _: SimpleNamespace(precise_sleep=lambda: setattr(clock, "value", clock.value + 0.004))
+    )
+    node.req()  # Real request queue, interpolation, units and SDK submission; no network.
+    assert len(commands) == 1000
+    angle = (Rotation.from_rotvec(commands[0][3:]).inv() * Rotation.from_rotvec(commands[-1][3:])).magnitude()
+    assert angle > np.deg2rad(1)
+    assert np.linalg.norm(commands[-1][:3] - commands[0][:3]) > 0.001
+
+
 def test_demo_preview_needs_no_tablet_or_robot(paper, tmp_path, monkeypatch):
     paper.save(tmp_path / "paper.json")
     monkeypatch.setattr(LinuxTablet, "discover", lambda: pytest.fail("Demo must not discover hardware."))
@@ -997,6 +1091,9 @@ def test_run_retracts_and_saves_after_interrupt_or_disconnect(paper, tmp_path, m
             return self
 
         def __exit__(self, *_):
+            pass
+
+        def grab(self):
             pass
 
     monkeypatch.setattr(entrypoint, "LinuxTablet", FakeTablet)

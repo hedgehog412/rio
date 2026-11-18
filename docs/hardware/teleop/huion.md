@@ -263,6 +263,21 @@ The aligned arm then moves to the selected travel height. Move the stylus slowly
 and test two separate strokes, checking their direction and the lift between them.
 Ctrl+C discards queued strokes and attempts a vertical retract to the travel height.
 
+After Enter, `run` captures the selected pen input node exclusively until exit;
+desktop applications no longer receive events from that node. Keyboard and separate
+mouse devices remain usable. Close `evtest --grab` or another exclusive reader first.
+
+Once per second, the terminal prints the motion phase, measured TCP displacement,
+tip height, wrist angle remaining, tracking error, and tablet report count/contact.
+At 2 mm/s with a 184 mm tip offset, the angular rate is bounded to about 0.62 degrees/s
+and can take a minute or more for a large starting angle. Watch the remaining angle
+decrease during `align`; tablet strokes are ignored until alignment finishes.
+If a pending move makes no measured position or orientation progress for three
+seconds, the run stops and attempts its normal cleanup. A dead RIO arm command
+thread is rejected even if the independent pose-report thread is still publishing.
+These diagnostics distinguish waiting for alignment, missing tablet events, and a
+command/feedback problem; a moving desktop cursor alone does not verify RIO input.
+
 An air gap raises position targets; it does not add force sensing. To make contact
 after a successful air test, rerun with `--air-gap-mm 0` (the default). Positive gaps
 are also included as `meta/drawing_air_gap_m` in recordings.

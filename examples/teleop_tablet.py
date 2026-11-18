@@ -10,6 +10,7 @@ gravity-compensated hand guiding. Only the explicit `run` command starts RIO.
 import argparse
 import json
 import multiprocessing as mp
+import threading
 import time as wall_time
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -369,7 +370,12 @@ def preview(args):
 
 
 def read_pose(env) -> np.ndarray:
-    state = env.robot.arm.get_state()
+    arm = env.robot.arm
+    if isinstance(arm, threading.Thread) and not arm.is_alive():
+        raise RuntimeError(
+            "RIO arm command thread has stopped, even if pose reports are still arriving. Check its error output."
+        )
+    state = arm.get_state()
     timestamp = float(state.get("timestamp", float("nan")))
     if not np.isfinite(timestamp) or not -0.1 <= time.now() - timestamp <= 0.5:
         raise RuntimeError("Robot state is missing or stale; no drawing command sent.")
@@ -377,6 +383,50 @@ def read_pose(env) -> np.ndarray:
     if measured.shape != (6,) or not np.isfinite(measured).all():
         raise RuntimeError("Robot reported an invalid TCP pose.")
     return measured
+
+
+class RunMonitor:
+    """Report input and measured progress; stop a pending move that makes no progress."""
+
+    def __init__(self, pose, now):
+        self.initial = np.asarray(pose).copy()
+        self.last_progress_pose = self.initial.copy()
+        self.last_progress_time = now
+        self.last_print = -float("inf")
+        self.reports = 0
+
+    def update(self, controller, measured, sample, reports, now):
+        self.reports += reports
+        displacement = np.linalg.norm(measured[:3] - self.last_progress_pose[:3])
+        rotation = (Rotation.from_rotvec(measured[3:]).inv() * Rotation.from_rotvec(self.last_progress_pose[3:])).magnitude()
+        if displacement > 0.0001 or rotation > np.deg2rad(0.05):
+            self.last_progress_pose = measured.copy()
+            self.last_progress_time = now
+        position_error = np.linalg.norm(measured[:3] - controller.position)
+        angle_error = (Rotation.from_rotvec(measured[3:]).inv() * Rotation.from_rotvec(controller.rotvec)).magnitude()
+        pending = controller.aligning or (bool(controller.queue) and position_error > controller.arrival_tolerance)
+        if not pending:
+            self.last_progress_time = now
+        if now - self.last_print >= 1:
+            _, _, height = controller.calibration.coordinates(controller.calibration.drawing_pose(measured)[:3])
+            remaining = (
+                Rotation.from_rotvec(measured[3:]).inv() * Rotation.from_rotvec(controller.calibration.rotvec)
+            ).magnitude()
+            moved = np.linalg.norm(measured[:3] - self.initial[:3]) * 1000
+            print(
+                f"phase={controller.phase}; TCP moved={moved:.2f} mm; tip height={height * 1000:+.2f} mm; "
+                f"wrist remaining={np.rad2deg(remaining):.2f} deg; "
+                f"tracking={position_error * 1000:.2f} mm/{np.rad2deg(angle_error):.2f} deg; "
+                f"tablet reports={self.reports}, tip-down={sample.touching}",
+                flush=True,
+            )
+            self.last_print = now
+        if pending and now - self.last_progress_time > 3:
+            raise RuntimeError(
+                f"No measured robot progress for 3 seconds during {controller.phase}. "
+                f"Tracking error={position_error * 1000:.2f} mm/{np.rad2deg(angle_error):.2f} deg. "
+                "Stopping; check controller mode, faults and the RIO command thread."
+            )
 
 
 def drawing_step(env, controller, dt, target_time, sample):
@@ -455,6 +505,8 @@ def run(args):
             tablet.poll()  # Discard all pre-session input; never replay old contact events.
             if tablet.events.touching:
                 raise ValueError("Stylus is touching the tablet. Lift it and restart.")
+            tablet.grab()
+            print("Tablet pen input node captured exclusively for teleoperation; released on exit.", flush=True)
             if np.linalg.norm(read_pose(env) - measured) > 0.001:
                 raise ValueError("Robot pose changed while waiting to start; restart.")
             controller = make_controller(args, calibration, measured)
@@ -463,6 +515,7 @@ def run(args):
             env.set_start_time(t_start)
             env.set_instruction(station.instruction)
             sample = TabletSample(0.0, 0.0, False, proximity=False)
+            monitor = RunMonitor(measured, time.now())
             dt = 1 / args.freq
             trace = None
             if env.recorder:
@@ -485,6 +538,7 @@ def run(args):
                         input_ready = True
                     was_aligning = controller.aligning
                     drawing_step(env, controller, dt, time.now() + 2 * dt + station.arm_latency, sample)
+                    monitor.update(controller, read_pose(env), sample, len(reports), time.now())
                     if was_aligning and not controller.aligning:
                         print("Wrist aligned. Lift the stylus, then begin drawing.")
                     time.precise_wait(tick_start + dt)
