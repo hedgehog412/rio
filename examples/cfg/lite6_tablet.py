@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass, field
 
-from rio.cfg import Camera, NodeCfg, RecorderCfg
+from rio.cfg import Camera, NodeCfg, RecorderCfg, VisualizerCfg
 
 
 @dataclass
@@ -20,7 +20,7 @@ class Lite6TabletStation:
     arm: str = "XarmArm"
     arm_cfg: NodeCfg = field(
         default_factory=lambda: NodeCfg(
-            robot_ip="192.168.1.111",
+            robot_ip="192.168.2.176",
             robot_model="lite6",
             robot_controller="task_pos",
             max_pos_speed=0.03,
@@ -32,9 +32,46 @@ class Lite6TabletStation:
     # The pen stays clamped. No gripper node is created or commanded.
     gripper: str | None = None
     teleop: str | None = None
-    cameras: dict[str, Camera] = field(default_factory=dict)
+    # Camera settings live here. Verify the left/right views after reconnecting USB.
+    cameras: dict[str, Camera] = field(
+        default_factory=lambda: {
+            "realsense": Camera(
+                addr="127.0.0.1:5130",
+                cam_type="Realsense",
+                serial="238222074772",
+                model="D400",
+                enable_color=True,
+                enable_depth=False,
+                resolution=(480, 640),
+                resolution_depth=(480, 640),
+                freq=30,
+            ),
+            "left": Camera(
+                addr="127.0.0.1:5131",
+                cam_type="Gphoto",
+                port="usb:001,002",
+                model="dslr",
+                resolution=(480, 640),
+                enable_color=True,
+                enable_depth=False,
+                freq=30,
+            ),
+            "right": Camera(
+                addr="127.0.0.1:5132",
+                cam_type="Gphoto",
+                port="usb:001,006",
+                model="dslr",
+                resolution=(480, 640),
+                enable_color=True,
+                enable_depth=False,
+                freq=30,
+            ),
+        }
+    )
     recorder: str | None = "Recorder"
     recorder_cfg: RecorderCfg = field(default_factory=lambda: RecorderCfg(path="data/drawing/"))
+    visualizer: str | None = None
+    visualizer_cfg: VisualizerCfg = field(default_factory=VisualizerCfg)
     mw: str = "Thread"
     mp_method: str = "spawn"
     freq: int = 50
