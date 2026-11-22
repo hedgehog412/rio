@@ -292,17 +292,23 @@ uv run -m examples.teleop_tablet run \
   --robot-ip 192.168.1.111 \
   --calibration paper.json \
   --device /dev/input/eventN \
-  --record-path data/drawing/ \
-  --note "Operator: Jihyun; drawing: flower"
+  --record-path data/drawing/
 ```
 
-`--note` is optional free text for the operator, drawing, or other session details.
+After Ctrl+C, the arm retracts and the recording is saved and closed. The terminal
+then prompts for optional notes, such as `Operator: Jihyun; drawing: flower`.
+Press Enter to skip or keep existing notes. Ctrl+C or end-of-input at this prompt
+also keeps the saved recording. The prompt is disabled by `--no-record`; hardware
+errors save the recording through the existing cleanup and propagate without a prompt.
+
 Every recording gets a unique UTC date/time filename with a short random suffix,
 such as `traj_20261122T190000_123456Z_a1b2c3d4.vla`. Existing recordings are preserved.
 If `--record-path` ends in `.vla`, its filename is used as a prefix; for example,
 `data/flower.vla` produces `data/flower_<timestamp>_<suffix>.vla`.
 A matching `.json` file stores the note, creation time, and trajectory filename;
-the note is also included in the recording as `meta/recording/note` when nonempty.
+notes entered at the closing prompt update this JSON without rewriting the `.vla`.
+You can still supply `--note "Operator: Jihyun; drawing: flower"` before recording;
+that initial note is also included as `meta/recording/note` in the `.vla` steps.
 
 Lift the stylus before pressing Enter. Pre-session events are discarded. The arm first
 retracts along the paper normal, then follows the tablet:

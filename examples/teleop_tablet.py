@@ -24,6 +24,25 @@ from rio.control.tablet import DrawingController, PaperCalibration, TabletSample
 from rio.control.tablet_input import LinuxTablet
 
 
+def prompt_recording_note(recording_path: str):
+    """Add optional session notes after the recording and hardware are closed."""
+    metadata_path = Path(recording_path).with_suffix(".json")
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        note = input("Recording saved. Notes (operator, drawing, etc.; Enter to skip/keep existing notes): ")
+        if not note.strip():
+            return
+        metadata["note"] = note
+        temporary_path = metadata_path.with_suffix(".json.tmp")
+        temporary_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        temporary_path.replace(metadata_path)
+        print(f"Notes saved to {metadata_path}")
+    except (EOFError, KeyboardInterrupt):
+        print("\nRecording saved; notes unchanged.")
+    except (OSError, ValueError) as error:
+        print(f"Could not save notes: {error}. Recording remains saved at {recording_path}.")
+
+
 def select_device(path: str) -> str:
     if path != "auto":
         return path
@@ -534,6 +553,7 @@ def run(args):
         station.recorder_cfg.path = args.record_path
     if getattr(args, "note", None) is not None:
         station.recorder_cfg.note = args.note
+    recording_path = None
     with LinuxTablet(select_device(args.device)) as tablet:
         if args.follow_tilt and not getattr(tablet, "tilt_supported", False):
             raise ValueError("Selected pen node does not expose both tilt axes. Use --no-follow-tilt for fixed-angle drawing.")
@@ -638,6 +658,8 @@ def run(args):
                         trace.close()
                     if env.recorder:
                         env.recorder.save(wait=True)
+    if isinstance(recording_path, str):
+        prompt_recording_note(recording_path)
 
 
 def main():
