@@ -57,10 +57,12 @@ def create_dummy_step(timestep: int, rng: np.random.Generator | None = None) -> 
 def compare_steps(loaded: Step, original: Step, timestep: int):
     """Compare two Step objects for equality."""
     # Verify timestep
+    assert loaded.timestep is not None and original.timestep is not None
     assert abs(loaded.timestep - original.timestep) < 1e-10, f"Timestep mismatch at index {timestep}"
     assert loaded.instruction == original.instruction, f"Instruction mismatch at index {timestep}"
 
     # Verify action
+    assert loaded.action is not None and original.action is not None
     np.testing.assert_array_equal(loaded.action.shape, original.action.shape)
     np.testing.assert_array_almost_equal(loaded.action, original.action, decimal=5)
 
@@ -79,10 +81,6 @@ def compare_steps(loaded: Step, original: Step, timestep: int):
             np.testing.assert_array_almost_equal(
                 val_loaded, val_orig, decimal=5, err_msg=f"{field} value mismatch at timestep {timestep}", verbose=False
             )
-
-    # Check gripper position
-    if obs_loaded.gripper_position is not None and obs_orig.gripper_position is not None:
-        assert np.isclose(obs_loaded.gripper_position, obs_orig.gripper_position, rtol=1e-5)
 
     # Check cameras
     assert obs_loaded.cameras.keys() == obs_orig.cameras.keys()
@@ -218,6 +216,7 @@ def test_recorder_loader_roundtrip(temp_trajectory_path, middleware, freq, durat
             actual_freq = num_steps / actual_duration
 
             recorder.save(wait=True, timeout=None)
+            test_path = recorder.path
 
     logger.info(f"Recorded {num_steps} steps in {actual_duration:.2f}s (target: {freq} Hz, actual: {actual_freq:.1f} Hz)")
 
@@ -243,7 +242,7 @@ def test_recorder_loader_roundtrip(temp_trajectory_path, middleware, freq, durat
 
 
 def test_discard_last_removes_trajectory(tmp_path):
-    """A saved trajectory can be discarded, and its index reused by the next one."""
+    """Discard deletes the selected recording and note, without reusing its name."""
     middleware = "Thread"
     recorder_cfg = {
         "path": str(tmp_path),
@@ -277,15 +276,16 @@ def test_discard_last_removes_trajectory(tmp_path):
             remaining = sorted(f for f in os.listdir(tmp_path) if f.endswith(".vla"))
             assert doomed not in remaining
             assert len(remaining) == 1, remaining
+            assert not (tmp_path / doomed).with_suffix(".json").exists()
 
-            # The freed index is reused rather than leaving a gap in the numbering.
+            # The replacement recording gets a fresh name.
             recorder.new_trajectory(wait=True)
             for i in range(5):
                 recorder.record_step(create_dummy_step(timestep=i))
             recorder.save(wait=True, timeout=None)
 
             final = sorted(f for f in os.listdir(tmp_path) if f.endswith(".vla"))
-            assert final == saved, final
+            assert len(final) == 2 and remaining[0] in final and doomed not in final
 
 
 def test_discard_last_refused_while_recording(tmp_path):

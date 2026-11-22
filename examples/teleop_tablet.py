@@ -532,6 +532,8 @@ def run(args):
         station.recorder = None
     if args.record_path:
         station.recorder_cfg.path = args.record_path
+    if getattr(args, "note", None) is not None:
+        station.recorder_cfg.note = args.note
     with LinuxTablet(select_device(args.device)) as tablet:
         if args.follow_tilt and not getattr(tablet, "tilt_supported", False):
             raise ValueError("Selected pen node does not expose both tilt axes. Use --no-follow-tilt for fixed-angle drawing.")
@@ -571,11 +573,18 @@ def run(args):
             dt = 1 / args.freq
             trace = None
             if env.recorder:
-                directory = Path(station.recorder_cfg.path)
+                recording_path = getattr(env.recorder, "path", None)
+                if isinstance(recording_path, str):
+                    directory = Path(recording_path).parent
+                    session = Path(recording_path).stem
+                else:
+                    directory = Path(station.recorder_cfg.path)
+                    if directory.suffix.lower() == ".vla" and not directory.is_dir():
+                        directory = directory.parent
+                    session = "tablet_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
                 directory.mkdir(parents=True, exist_ok=True)
-                session = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-                calibration.save(directory / f"tablet_{session}_calibration.json")
-                trace = (directory / f"tablet_{session}_input.jsonl").open("w")
+                calibration.save(directory / f"{session}_calibration.json")
+                trace = (directory / f"{session}_input.jsonl").open("x")
             try:
                 while True:
                     tick_start = time.now()
@@ -695,7 +704,8 @@ def main():
         else:
             child.add_argument("--robot-ip", help="Override the IP in the station.")
             child.add_argument("--station", help="Registered Lite6 drawing station with your cameras/recorder settings.")
-            child.add_argument("--record-path", help="Override the recorder directory (default: data/drawing/).")
+            child.add_argument("--record-path", help="Recorder directory or .vla filename prefix (default: data/drawing/).")
+            child.add_argument("--note", help="Optional recording note, e.g. operator name and what was drawn.")
             child.add_argument("--no-record", action="store_true")
             child.add_argument(
                 "--air-gap-mm",

@@ -3,7 +3,11 @@
 
 import json
 import os
+from datetime import datetime, timezone
+from importlib import import_module
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 from loguru import logger
@@ -26,7 +30,7 @@ except ImportError:
     logger.warning("psutil is not installed. System stats will not be collected.")
 
 try:
-    import pynvml
+    pynvml = import_module("pynvml")
 
     pynvml.nvmlInit()
     _gpu_available = True
@@ -85,6 +89,7 @@ class Recorder(Node):
         start_recording: bool = True,
         log_stats: bool = False,
         system_stats_freq: int = 1,
+        note: str = "",
         *,
         freq: int = 100,
         max_buffer_size: int = 100,
@@ -95,10 +100,13 @@ class Recorder(Node):
         Initialize the Recorder node.
         """
         self.base_path = path
+        if not isinstance(note, str):
+            raise ValueError("Recording note must be text.")
+        self.note = note
         self.video_codec = video_codec
         self.codec_options = codec_options or {}
         self.raw_codec = raw_codec
-        self.datamanager = None
+        self.datamanager: Any = None
         self.traj_prefix = None
         self.dataset_path = None
         self.time_unit = kwargs.get("time_unit", "s")
@@ -145,25 +153,24 @@ class Recorder(Node):
 
     def _create_datamanager(self):
         """Create the robodm Trajectory datamanager."""
+        if robodm is None:
+            raise ImportError("robodm is required for recording.")
+        options: dict[str, Any] = {
+            "path": self.path,
+            "mode": "w",
+            "video_codec": self.video_codec,
+            "codec_options": self.codec_options,
+            "raw_codec": self.raw_codec,
+        }
         try:
-            self.datamanager = robodm.Trajectory(
-                path=self.path,
-                mode="w",
-                video_codec=self.video_codec,
-                codec_options=self.codec_options,
-                raw_codec=self.raw_codec,
-            )
+            self.datamanager = robodm.Trajectory(**options)
         except TypeError:
             # Fall back for older robodm versions without raw_codec support
-            self.datamanager = robodm.Trajectory(
-                path=self.path,
-                mode="w",
-                video_codec=self.video_codec,
-                codec_options=self.codec_options,
-            )
+            options.pop("raw_codec")
+            self.datamanager = robodm.Trajectory(**options)
 
     def _init_stats(self):
-        self.stats = {
+        self.stats: dict[str, Any] = {
             "file_name": self.path,
             "start_time": time.now(),
             "steps_recorded": 0,
@@ -239,47 +246,26 @@ class Recorder(Node):
             except Exception as e:
                 logger.debug(f"Error capturing GPU stats: {e}")
 
-    def _init_dataset(self) -> str:
-        """
-        parse and validate the trajectory path and define the trajectory index.
-        """
-        self.traj_index = -1
-        # check if base_path already exists and if it's a directory, find the next available traj_index
-        if os.path.exists(self.base_path):
-            logger.info(f"Adding new trajectories to existing dataset at {self.base_path}")
-
-            # find the last traj_index used assuming a format anyname_####.vla
-            if os.path.isdir(self.base_path):
-                self.dataset_path = self.base_path
-                self.traj_prefix = "traj_"
-
-            elif self.base_path.endswith(".vla"):
-                # if it's a file, check if it ends with .vla and increment index accordingly
-                base_no_ext = self.base_path[:-4]
-                self.traj_prefix = os.path.basename(base_no_ext)
-                self.dataset_path = os.path.dirname(self.base_path)
-            else:
-                os.makedirs(self.base_path, exist_ok=True)
-                self.dataset_path = self.base_path
-                self.traj_prefix = "traj_"
-                # raise ValueError(f"Invalid path: {self.base_path}. Must be a directory or a .vla file.")
-
-            existing_trajs = [fname for fname in os.listdir(self.dataset_path) if fname.endswith(".vla")]
-            existing_indices = [int(fname[-8:-4]) for fname in existing_trajs if fname[-8:-4].isdigit()]
-            if existing_indices:
-                self.traj_index = max(existing_indices)
+    def _set_destination(self, path: str):
+        """Interpret a .vla path as a prefix; all other paths name directories."""
+        destination = Path(path).expanduser().absolute()
+        if destination.suffix.lower() == ".vla" and not destination.is_dir():
+            self.dataset_path = str(destination.parent)
+            self.traj_prefix = destination.stem
         else:
-            if self.base_path.endswith(".vla"):
-                self.dataset_path = os.path.dirname(self.base_path)
-                self.traj_prefix = os.path.basename(self.base_path)[:-4]
-            else:
-                os.makedirs(self.base_path, exist_ok=True)
-                self.dataset_path = self.base_path
-                self.traj_prefix = "traj_"
+            self.dataset_path = str(destination)
+            self.traj_prefix = "traj"
+        os.makedirs(self.dataset_path, exist_ok=True)
+        self.base_path = str(destination)
+
+    def _init_dataset(self):
+        """Initialize the recording destination without reusing an existing file."""
+        self.traj_index = -1
+        self._set_destination(self.base_path)
 
         if self.start_recording:
             logger.info("Starting first trajectory immediately upon initialization.")
-            self._new_trajectory(self.dataset_path)
+            self._new_trajectory()
         else:
             logger.warning("Recorder initialized with start_recording=False. Call new_trajectory() to start recording.")
             self.is_closed = True
@@ -325,7 +311,7 @@ class Recorder(Node):
                         self._discard_last()
                     elif req_type == "new_trajectory":
                         if self.is_closed:
-                            self._new_trajectory(req.get("path"))
+                            self._new_trajectory(req.get("path"), req.get("note"))
                         else:
                             logger.warning("Cannot start new trajectory before saving the current one.")
                     else:
@@ -392,7 +378,10 @@ class Recorder(Node):
             return
 
         try:
-            self.datamanager.add_by_dict(state, timestamp=timestamp, time_unit=self.time_unit)
+            recorded = dict(state)
+            if self.note:
+                recorded["meta/recording/note"] = self.note
+            self.datamanager.add_by_dict(recorded, timestamp=timestamp, time_unit=self.time_unit)
         except Exception as e:
             logger.error(f"Error recording dict: {e}")
 
@@ -450,14 +439,17 @@ class Recorder(Node):
             stats_path = discarded[:-4] + "_stats.json"
             if os.path.exists(stats_path):
                 os.remove(stats_path)
+            metadata_path = Path(discarded).with_suffix(".json")
+            if metadata_path.exists():
+                metadata_path.unlink()
 
-            # Reuse the freed index for the next trajectory.
+            # Keep the episode counter consistent; filenames are always unique.
             self.traj_index = max(self.traj_index - 1, -1)
             self.last_saved_path = None
         except OSError as e:
             logger.error(f"Error discarding trajectory {discarded}: {e}")
 
-    def _new_trajectory(self, path: str | None = None):
+    def _new_trajectory(self, path: str | None = None, note: str | None = None):
         """
         Internal method to start a new trajectory in the same recorder instance.
         """
@@ -467,16 +459,35 @@ class Recorder(Node):
 
         if self.dataset_path is None or self.traj_prefix is None:
             raise ValueError("Dataset path is not set. Make sure the dataset was initialized correctly.")
+        if path is not None:
+            self._set_destination(path)
+        if note is not None:
+            if not isinstance(note, str):
+                raise ValueError("Recording note must be text.")
+            self.note = note
 
         self.traj_index += 1
 
-        if path is None:
-            path = self.base_path
-        if os.path.isdir(self.base_path):
-            traj_filename = f"{self.traj_prefix}{self.traj_index:04d}.vla"
-            self.path = os.path.join(self.dataset_path, traj_filename)
-        else:
-            self.path = self.base_path
+        while True:
+            created = datetime.now(timezone.utc)
+            stamp = created.strftime("%Y%m%dT%H%M%S_%fZ")
+            target = Path(self.dataset_path) / f"{self.traj_prefix}_{stamp}_{uuid4().hex[:8]}.vla"
+            if target.exists():
+                continue
+            metadata_path = target.with_suffix(".json")
+            try:
+                # Exclusive sidecar creation also reserves this name for concurrent recorders.
+                with metadata_path.open("x", encoding="utf-8") as metadata:
+                    json.dump(
+                        {"trajectory": target.name, "created_at": created.isoformat(), "note": self.note},
+                        metadata,
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+            except FileExistsError:
+                continue
+            self.path = str(target)
+            break
 
         logger.info("Starting new trajectory...")
         self._create_datamanager()
@@ -548,16 +559,21 @@ class Recorder(Node):
 
             logger.info("Recorder finished saving trajectory.")
 
-    def new_trajectory(self, path: str | None = None, wait: bool = True, timeout: float | None = 600):
+    def new_trajectory(self, path: str | None = None, wait: bool = True, timeout: float | None = 600, note: str | None = None):
         """
-        Start a new trajectory in the same recorder instance.
+        Start a uniquely named trajectory, optionally changing its destination or note.
+
+        Omit note to keep the previous note; pass an empty string to clear it.
         """
+        if note is not None and not isinstance(note, str):
+            raise ValueError("Recording note must be text.")
         if not self._status().get("is_closed", True):
             raise RuntimeError("Cannot start a new trajectory before saving the current one.")
 
         req = {
             "type": "new_trajectory",
             "path": path,
+            "note": note,
         }
         self.request_queue.put(req)
         # The resolved path lives on the node, which logs it once the request is served.

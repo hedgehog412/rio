@@ -292,8 +292,17 @@ uv run -m examples.teleop_tablet run \
   --robot-ip 192.168.1.111 \
   --calibration paper.json \
   --device /dev/input/eventN \
-  --record-path data/drawing/
+  --record-path data/drawing/ \
+  --note "Operator: Jihyun; drawing: flower"
 ```
+
+`--note` is optional free text for the operator, drawing, or other session details.
+Every recording gets a unique UTC date/time filename with a short random suffix,
+such as `traj_20261122T190000_123456Z_a1b2c3d4.vla`. Existing recordings are preserved.
+If `--record-path` ends in `.vla`, its filename is used as a prefix; for example,
+`data/flower.vla` produces `data/flower_<timestamp>_<suffix>.vla`.
+A matching `.json` file stores the note, creation time, and trajectory filename;
+the note is also included in the recording as `meta/recording/note` when nonempty.
 
 Lift the stylus before pressing Enter. Pre-session events are discarded. The arm first
 retracts along the paper normal, then follows the tablet:
@@ -378,8 +387,8 @@ no-progress checks. No default gripper or startup homing motion is configured.
 
 The recorder saves normal RIO robot states/actions and camera observations. Each step
 also contains `meta/tablet/*`, drawing phase, queue length, and target time. A companion
-`tablet_<session>_input.jsonl` preserves every raw report with its kernel timestamp and
-relative host receipt time; `tablet_<session>_calibration.json` preserves the mapping.
+`<recording-stem>_input.jsonl` preserves every raw report with its kernel timestamp and
+relative host receipt time; `<recording-stem>_calibration.json` preserves the mapping.
 `--no-record` disables both recording and these companion files.
 
 To include cameras, add them to `Lite6TabletStation` in `examples/cfg/lite6_tablet.py`,

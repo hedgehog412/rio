@@ -18,6 +18,7 @@ class RecorderCfg:
     codec_options: dict = field(default_factory=lambda: {"crf": "23", "preset": "fast"})
     verbose: bool = True
     start_recording: bool = True
+    note: str = ""
 
 
 @dataclass
